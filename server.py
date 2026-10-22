@@ -7,6 +7,7 @@ Features:
   - Hamburger menu housing Select mode, Upload, New Folder, and .dotfiles toggle
   - Hidden-by-default checkboxes; toggling Select reveals checkboxes & command bar (Copy, Move, Rename, Delete)
   - Persistent cross-folder clipboard bar (Copy/Cut items, navigate via breadcrumbs, Paste Here)
+  - Storage usage bar below the file list showing free space / total space and fill meter
   - Color-coded badges and filenames by filetype (Folders, Code, Media, Images, Archives, Docs)
   - Instant client-side search filter, column sorting, and HTTP Range streaming (206 Partial Content)
 
@@ -122,7 +123,7 @@ def unique_dest_path(dest_dir: str, basename: str) -> str:
 
 
 class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
-    server_version = "TermuxHTTP/2.1"
+    server_version = "TermuxHTTP/2.2"
 
     def end_headers(self):
         self.send_header("Accept-Ranges", "bytes")
@@ -255,6 +256,229 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                         raise ValueError("Cannot copy or move root directory")
                     if not os.path.exists(src_path) and not os.path.islink(src_path):
                         continue
+                    basename = os.path.basename(src_path.rstrip("/\\"))
+                    if action == "copy":
+                        target_path = unique_dest_path(dest_dir, basename)
+                        if os.path.isdir(src_path) and not os.path.islink(src_path):
+                            if os.path.commonpath([src_path, target_path]) == src_path:
+                                raise ValueError(f"Cannot copy folder '{basename}' into itself")
+                            shutil.copytree(src_path, target_path, symlinks=True)
+                        else:
+                            shutil.copy2(src_path, target_path, follow_symlinks=False)
+                        processed += 1
+                    else:  # move
+                        target_path = os.path.join(dest_dir, basename)
+                        if os.path.abspath(src_path) == os.path.abspath(target_path):
+                            continue
+                        if os.path.exists(target_path) or os.path.islink(target_path):
+                            raise ValueError(f"'{basename}' already exists in destination")
+                        if os.path.isdir(src_path) and os.path.commonpath([src_path, dest_dir]) == src_path:
+                            raise ValueError(f"Cannot move folder '{basename}' into itself")
+                        shutil.move(src_path, target_path)
+                        processed += 1
+
+                self.send_json(HTTPStatus.OK, {"ok": True, "processed": processed})
+
+            elif action == "mkdir":
+                dir_rel = data.get("dir", "/")
+                folder_name = (data.get("name") or "").strip()
+                if not folder_name or "/" in folder_name or "\\" in folder_name or folder_name in (".", ".."):
+                    raise ValueError("Invalid folder name")
+                parent_dir = resolve_safe_path(dir_rel)
+                new_dir = os.path.join(parent_dir, folder_name)
+                if os.path.exists(new_dir):
+                    raise ValueError(f"'{folder_name}' already exists")
+                os.makedirs(new_dir)
+                self.send_json(HTTPStatus.OK, {"ok": True})
+
+            else:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Unknown action: {action}"})
+        except Exception as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+
+    def send_range_response(self, path: str, range_header: str):
+        try:
+            file_size = os.path.getsize(path)
+            m = re.match(r"bytes=(\d*)-(\d*)", range_header)
+            if not m:
+                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                return
+
+            start_str, end_str = m.groups()
+            start = int(start_str) if start_str else 0
+            end = int(end_str) if end_str else file_size - 1
+            if start >= file_size or start > end:
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.end_headers()
+                return
+
+            end = min(end, file_size - 1)
+            length = end - start + 1
+            ctype = self.guess_type(path)
+
+            with open(path, "rb") as f:
+                f.seek(start)
+                self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Last-Modified", self.date_time_string(os.path.getmtime(path)))
+                self.end_headers()
+                remaining = length
+                buf_size = 64 * 1024
+                while remaining > 0:
+                    chunk = f.read(min(buf_size, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def list_directory(self, path: str):
+        try:
+            entries = os.listdir(path)
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "No permission to list directory")
+            return None
+
+        url_path = urllib.parse.unquote(self.path.split("?", 1)[0])
+        if not url_path.startswith("/"):
+            url_path = "/" + url_path
+        if not url_path.endswith("/"):
+            url_path += "/"
+
+        # Build breadcrumb segments
+        segments = [seg for seg in url_path.strip("/").split("/") if seg]
+        crumbs_html = ['<a href="/" class="crumb root-crumb">~</a>']
+        accum = ""
+        for idx, seg in enumerate(segments):
+            accum += "/" + urllib.parse.quote(seg)
+            is_last = idx == len(segments) - 1
+            cls = "crumb active-crumb" if is_last else "crumb"
+            crumbs_html.append('<span class="crumb-sep">/</span>')
+            crumbs_html.append(f'<a href="{accum}/" class="{cls}">{html.escape(seg)}</a>')
+        breadcrumb_bar = "".join(crumbs_html)
+
+        items = []
+        dir_count = 0
+        file_count = 0
+        for name in entries:
+            full_path = os.path.join(path, name)
+            is_dir = os.path.isdir(full_path)
+            is_link = os.path.islink(full_path)
+            try:
+                st = os.stat(full_path)
+                size = st.st_size if not is_dir else -1
+                mtime = st.st_mtime
+            except OSError:
+                size = 0
+                mtime = 0
+
+            if is_dir:
+                dir_count += 1
+            else:
+                file_count += 1
+
+            badge, css_class = classify_file(name, is_dir, is_link)
+            display_name = name + "/" if is_dir else name
+            href = urllib.parse.quote(name, errors="surrogatepass") + ("/" if is_dir else "")
+            rel_item_path = posixpath.join(url_path, name)
+            size_str = "—" if is_dir else human_size(size)
+            mtime_str = (
+                datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+                if mtime
+                else "—"
+            )
+            items.append({
+                "name": name,
+                "display_name": display_name,
+                "href": href,
+                "rel_path": rel_item_path,
+                "is_dir": 1 if is_dir else 0,
+                "size": size,
+                "size_str": size_str,
+                "mtime": mtime,
+                "mtime_str": mtime_str,
+                "badge": badge,
+                "css_class": css_class,
+                "hidden": name.startswith("."),
+            })
+
+        # Sort directories first, then alphabetically case-insensitive
+        items.sort(key=lambda x: (-x["is_dir"], x["name"].lower()))
+
+        rows_html = []
+        if url_path != "/":
+            parent_href = posixpath.normpath(url_path.rstrip("/") + "/..")
+            if not parent_href.endswith("/"):
+                parent_href += "/"
+            rows_html.append(
+                f'<tr class="parent-row" data-isdir="2" data-name=".." data-size="-1" data-mtime="0">'
+                f'<td class="col-check"></td>'
+                f'<td class="col-name"><a href="{parent_href}" class="row-link ft-dir">'
+                f'<span class="badge badge-dir">UP</span><span class="fname">.. (Parent Directory)</span></a></td>'
+                f'<td class="col-size">—</td>'
+                f'<td class="col-date">—</td>'
+                f"</tr>"
+            )
+
+        for it in items:
+            hidden_attr = ' data-hidden="1"' if it["hidden"] else ""
+            esc_rel = html.escape(it["rel_path"], quote=True)
+            esc_raw_name = html.escape(it["name"], quote=True)
+            rows_html.append(
+                f'<tr class="item-row"{hidden_attr} '
+                f'data-isdir="{it["is_dir"]}" '
+                f'data-name="{html.escape(it["name"].lower(), quote=True)}" '
+                f'data-rawname="{esc_raw_name}" '
+                f'data-path="{esc_rel}" '
+                f'data-size="{it["size"]}" '
+                f'data-mtime="{it["mtime"]:.0f}">'
+                f'<td class="col-check">'
+                f'<input type="checkbox" class="row-check" value="{esc_rel}" aria-label="Select {esc_raw_name}">'
+                f"</td>"
+                f'<td class="col-name">'
+                f'<a href="{it["href"]}" class="row-link {it["css_class"]}">'
+                f'<span class="badge badge-{it["css_class"]}">{it["badge"]}</span>'
+                f'<span class="fname">{html.escape(it["display_name"])}</span>'
+                f"</a></td>"
+                f'<td class="col-size">{it["size_str"]}</td>'
+                f'<td class="col-date">{it["mtime_str"]}</td>'
+                f"</tr>"
+            )
+
+        rows_str = "\n".join(rows_html)
+        enc = sys.getfilesystemencoding()
+        title = html.escape(url_path)
+        current_dir_js = json.dumps(url_path)
+
+        # Storage usage calculation for the current directory's filesystem
+        try:
+            usage = shutil.disk_usage(path)
+            free_str = human_size(usage.free)
+            total_str = human_size(usage.total)
+            used_str = human_size(usage.used)
+            used_pct = (usage.used / usage.total * 100.0) if usage.total > 0 else 0.0
+        except OSError:
+            free_str, total_str, used_str, used_pct = "—", "—", "—", 0.0
+
+        if used_pct >= 90:
+            fill_class = "fill-high"
+        elif used_pct >= 75:
+            fill_class = "fill-warn"
+        else:
+            fill_class = "fill-ok"
+
+        page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} — Termux HTTP</title>
+<style>
+  :                continue
                     basename = os.path.basename(src_path.rstrip("/\\"))
                     if action == "copy":
                         target_path = unique_dest_path(dest_dir, basename)
