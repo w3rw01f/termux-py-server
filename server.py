@@ -478,212 +478,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} — Termux HTTP</title>
 <style>
-  :                continue
-                    basename = os.path.basename(src_path.rstrip("/\\"))
-                    if action == "copy":
-                        target_path = unique_dest_path(dest_dir, basename)
-                        if os.path.isdir(src_path) and not os.path.islink(src_path):
-                            if os.path.commonpath([src_path, target_path]) == src_path:
-                                raise ValueError(f"Cannot copy folder '{basename}' into itself")
-                            shutil.copytree(src_path, target_path, symlinks=True)
-                        else:
-                            shutil.copy2(src_path, target_path, follow_symlinks=False)
-                        processed += 1
-                    else:  # move
-                        target_path = os.path.join(dest_dir, basename)
-                        if os.path.abspath(src_path) == os.path.abspath(target_path):
-                            continue
-                        if os.path.exists(target_path) or os.path.islink(target_path):
-                            raise ValueError(f"'{basename}' already exists in destination")
-                        if os.path.isdir(src_path) and os.path.commonpath([src_path, dest_dir]) == src_path:
-                            raise ValueError(f"Cannot move folder '{basename}' into itself")
-                        shutil.move(src_path, target_path)
-                        processed += 1
-
-                self.send_json(HTTPStatus.OK, {"ok": True, "processed": processed})
-
-            elif action == "mkdir":
-                dir_rel = data.get("dir", "/")
-                folder_name = (data.get("name") or "").strip()
-                if not folder_name or "/" in folder_name or "\\" in folder_name or folder_name in (".", ".."):
-                    raise ValueError("Invalid folder name")
-                parent_dir = resolve_safe_path(dir_rel)
-                new_dir = os.path.join(parent_dir, folder_name)
-                if os.path.exists(new_dir):
-                    raise ValueError(f"'{folder_name}' already exists")
-                os.makedirs(new_dir)
-                self.send_json(HTTPStatus.OK, {"ok": True})
-
-            else:
-                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Unknown action: {action}"})
-        except Exception as exc:
-            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
-
-    def send_range_response(self, path: str, range_header: str):
-        try:
-            file_size = os.path.getsize(path)
-            m = re.match(r"bytes=(\d*)-(\d*)", range_header)
-            if not m:
-                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                return
-
-            start_str, end_str = m.groups()
-            start = int(start_str) if start_str else 0
-            end = int(end_str) if end_str else file_size - 1
-            if start >= file_size or start > end:
-                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                self.send_header("Content-Range", f"bytes */{file_size}")
-                self.end_headers()
-                return
-
-            end = min(end, file_size - 1)
-            length = end - start + 1
-            ctype = self.guess_type(path)
-
-            with open(path, "rb") as f:
-                f.seek(start)
-                self.send_response(HTTPStatus.PARTIAL_CONTENT)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-                self.send_header("Content-Length", str(length))
-                self.send_header("Last-Modified", self.date_time_string(os.path.getmtime(path)))
-                self.end_headers()
-                remaining = length
-                buf_size = 64 * 1024
-                while remaining > 0:
-                    chunk = f.read(min(buf_size, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    def list_directory(self, path: str):
-        try:
-            entries = os.listdir(path)
-        except OSError:
-            self.send_error(HTTPStatus.NOT_FOUND, "No permission to list directory")
-            return None
-
-        url_path = urllib.parse.unquote(self.path.split("?", 1)[0])
-        if not url_path.startswith("/"):
-            url_path = "/" + url_path
-        if not url_path.endswith("/"):
-            url_path += "/"
-
-        # Build breadcrumb segments
-        segments = [seg for seg in url_path.strip("/").split("/") if seg]
-        crumbs_html = ['<a href="/" class="crumb root-crumb">~</a>']
-        accum = ""
-        for idx, seg in enumerate(segments):
-            accum += "/" + urllib.parse.quote(seg)
-            is_last = idx == len(segments) - 1
-            cls = "crumb active-crumb" if is_last else "crumb"
-            crumbs_html.append('<span class="crumb-sep">/</span>')
-            crumbs_html.append(f'<a href="{accum}/" class="{cls}">{html.escape(seg)}</a>')
-        breadcrumb_bar = "".join(crumbs_html)
-
-        items = []
-        dir_count = 0
-        file_count = 0
-        for name in entries:
-            full_path = os.path.join(path, name)
-            is_dir = os.path.isdir(full_path)
-            is_link = os.path.islink(full_path)
-            try:
-                st = os.stat(full_path)
-                size = st.st_size if not is_dir else -1
-                mtime = st.st_mtime
-            except OSError:
-                size = 0
-                mtime = 0
-
-            if is_dir:
-                dir_count += 1
-            else:
-                file_count += 1
-
-            badge, css_class = classify_file(name, is_dir, is_link)
-            display_name = name + "/" if is_dir else name
-            href = urllib.parse.quote(name, errors="surrogatepass") + ("/" if is_dir else "")
-            rel_item_path = posixpath.join(url_path, name)
-            size_str = "—" if is_dir else human_size(size)
-            mtime_str = (
-                datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
-                if mtime
-                else "—"
-            )
-            items.append({
-                "name": name,
-                "display_name": display_name,
-                "href": href,
-                "rel_path": rel_item_path,
-                "is_dir": 1 if is_dir else 0,
-                "size": size,
-                "size_str": size_str,
-                "mtime": mtime,
-                "mtime_str": mtime_str,
-                "badge": badge,
-                "css_class": css_class,
-                "hidden": name.startswith("."),
-            })
-
-        # Sort directories first, then alphabetically case-insensitive
-        items.sort(key=lambda x: (-x["is_dir"], x["name"].lower()))
-
-        rows_html = []
-        if url_path != "/":
-            parent_href = posixpath.normpath(url_path.rstrip("/") + "/..")
-            if not parent_href.endswith("/"):
-                parent_href += "/"
-            rows_html.append(
-                f'<tr class="parent-row" data-isdir="2" data-name=".." data-size="-1" data-mtime="0">'
-                f'<td class="col-check"></td>'
-                f'<td class="col-name"><a href="{parent_href}" class="row-link ft-dir">'
-                f'<span class="badge badge-dir">UP</span><span class="fname">.. (Parent Directory)</span></a></td>'
-                f'<td class="col-size">—</td>'
-                f'<td class="col-date">—</td>'
-                f"</tr>"
-            )
-
-        for it in items:
-            hidden_attr = ' data-hidden="1"' if it["hidden"] else ""
-            esc_rel = html.escape(it["rel_path"], quote=True)
-            esc_raw_name = html.escape(it["name"], quote=True)
-            rows_html.append(
-                f'<tr class="item-row"{hidden_attr} '
-                f'data-isdir="{it["is_dir"]}" '
-                f'data-name="{html.escape(it["name"].lower(), quote=True)}" '
-                f'data-rawname="{esc_raw_name}" '
-                f'data-path="{esc_rel}" '
-                f'data-size="{it["size"]}" '
-                f'data-mtime="{it["mtime"]:.0f}">'
-                f'<td class="col-check">'
-                f'<input type="checkbox" class="row-check" value="{esc_rel}" aria-label="Select {esc_raw_name}">'
-                f"</td>"
-                f'<td class="col-name">'
-                f'<a href="{it["href"]}" class="row-link {it["css_class"]}">'
-                f'<span class="badge badge-{it["css_class"]}">{it["badge"]}</span>'
-                f'<span class="fname">{html.escape(it["display_name"])}</span>'
-                f"</a></td>"
-                f'<td class="col-size">{it["size_str"]}</td>'
-                f'<td class="col-date">{it["mtime_str"]}</td>'
-                f"</tr>"
-            )
-
-        rows_str = "\n".join(rows_html)
-        enc = sys.getfilesystemencoding()
-        title = html.escape(url_path)
-        current_dir_js = json.dumps(url_path)
-
-        page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} — Termux HTTP</title>
-<style>
   :root {{
     --bg: #0c0e12;
     --surface: #131720;
@@ -711,307 +505,13 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     font-size: 14px;
     line-height: 1.5;
     padding-bottom: 84px;
-} basename = os.path.basename(src_path.rstrip("/\\"))
-                    if action == "copy":
-                        target_path = unique_dest_path(dest_dir, basename)
-                        if os.path.isdir(src_path) and not os.path.islink(src_path):
-                            if os.path.commonpath([src_path, target_path]) == src_path:
-                                raise ValueError(f"Cannot copy folder '{basename}' into itself")
-                            shutil.copytree(src_path, target_path, symlinks=True)
-                        else:
-                            shutil.copy2(src_path, target_path, follow_symlinks=False)
-                        processed += 1
-                    else:  # move
-                        target_path = os.path.join(dest_dir, basename)
-                        if os.path.abspath(src_path) == os.path.abspath(target_path):
-                            continue
-                        if os.path.exists(target_path) or os.path.islink(target_path):
-                            raise ValueError(f"'{basename}' already exists in destination")
-                        if os.path.isdir(src_path) and os.path.commonpath([src_path, dest_dir]) == src_path:
-                            raise ValueError(f"Cannot move folder '{basename}' into itself")
-                        shutil.move(src_path, target_path)
-                        processed += 1
-
-                self.send_json(HTTPStatus.OK, {"ok": True, "processed": processed})
-
-            elif action == "mkdir":
-                dir_rel = data.get("dir", "/")
-                folder_name = (data.get("name") or "").strip()
-                if not folder_name or "/" in folder_name or "\\" in folder_name or folder_name in (".", ".."):
-                    raise ValueError("Invalid folder name")
-                parent_dir = resolve_safe_path(dir_rel)
-                new_dir = os.path.join(parent_dir, folder_name)
-                if os.path.exists(new_dir):
-                    raise ValueError(f"'{folder_name}' already exists")
-                os.makedirs(new_dir)
-                self.send_json(HTTPStatus.OK, {"ok": True})
-
-            else:
-                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Unknown action: {action}"})
-        except Exception as exc:
-            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
-
-    def send_range_response(self, path: str, range_header: str):
-        try:
-            file_size = os.path.getsize(path)
-            m = re.match(r"bytes=(\d*)-(\d*)", range_header)
-            if not m:
-                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                return
-
-            start_str, end_str = m.groups()
-            start = int(start_str) if start_str else 0
-            end = int(end_str) if end_str else file_size - 1
-            if start >= file_size or start > end:
-                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                self.send_header("Content-Range", f"bytes */{file_size}")
-                self.end_headers()
-                return
-
-            end = min(end, file_size - 1)
-            length = end - start + 1
-            ctype = self.guess_type(path)
-
-            with open(path, "rb") as f:
-                f.seek(start)
-                self.send_response(HTTPStatus.PARTIAL_CONTENT)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-                self.send_header("Content-Length", str(length))
-                self.send_header("Last-Modified", self.date_time_string(os.path.getmtime(path)))
-                self.end_headers()
-                remaining = length
-                buf_size = 64 * 1024
-                while remaining > 0:
-                    chunk = f.read(min(buf_size, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    def list_directory(self, path: str):
-        try:
-            entries = os.listdir(path)
-        except OSError:
-            self.send_error(HTTPStatus.NOT_FOUND, "No permission to list directory")
-            return None
-
-        url_path = urllib.parse.unquote(self.path.split("?", 1)[0])
-        if not url_path.startswith("/"):
-            url_path = "/" + url_path
-        if not url_path.endswith("/"):
-            url_path += "/"
-
-        # Build breadcrumb segments
-        segments = [seg for seg in url_path.strip("/").split("/") if seg]
-        crumbs_html = ['<a href="/" class="crumb root-crumb">~</a>']
-        accum = ""
-        for idx, seg in enumerate(segments):
-            accum += "/" + urllib.parse.quote(seg)
-            is_last = idx == len(segments) - 1
-            cls = "crumb active-crumb" if is_last else "crumb"
-            crumbs_html.append('<span class="crumb-sep">/</span>')
-            crumbs_html.append(f'<a href="{accum}/" class="{cls}">{html.escape(seg)}</a>')
-        breadcrumb_bar = "".join(crumbs_html)
-
-        items = []
-        dir_count = 0
-        file_count = 0
-        for name in entries:
-            full_path = os.path.join(path, name)
-            is_dir = os.path.isdir(full_path)
-            is_link = os.path.islink(full_path)
-            try:
-                st = os.stat(full_path)
-                size = st.st_size if not is_dir else -1
-                mtime = st.st_mtime
-            except OSError:
-                size = 0
-                mtime = 0
-
-            if is_dir:
-                dir_count += 1
-            else:
-                file_count += 1
-
-            badge, css_class = classify_file(name, is_dir, is_link)
-            display_name = name + "/" if is_dir else name
-            href = urllib.parse.quote(name, errors="surrogatepass") + ("/" if is_dir else "")
-            rel_item_path = posixpath.join(url_path, name)
-            size_str = "—" if is_dir else human_size(size)
-            mtime_str = (
-                datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
-                if mtime
-                else "—"
-            )
-            items.append({
-                "name": name,
-                "display_name": display_name,
-                "href": href,
-                "rel_path": rel_item_path,
-                "is_dir": 1 if is_dir else 0,
-                "size": size,
-                "size_str": size_str,
-                "mtime": mtime,
-                "mtime_str": mtime_str,
-                "badge": badge,
-                "css_class": css_class,
-                "hidden": name.startswith("."),
-            })
-
-        # Sort directories first, then alphabetically case-insensitive
-        items.sort(key=lambda x: (-x["is_dir"], x["name"].lower()))
-
-        rows_html = []
-        if url_path != "/":
-            parent_href = posixpath.normpath(url_path.rstrip("/") + "/..")
-            if not parent_href.endswith("/"):
-                parent_href += "/"
-            rows_html.append(
-                f'<tr class="parent-row" data-isdir="2" data-name=".." data-size="-1" data-mtime="0">'
-                f'<td class="col-check"></td>'
-                f'<td class="col-name"><a href="{parent_href}" class="row-link ft-dir">'
-                f'<span class="badge badge-dir">UP</span><span class="fname">.. (Parent Directory)</span></a></td>'
-                f'<td class="col-size">—</td>'
-                f'<td class="col-date">—</td>'
-                f"</tr>"
-            )
-
-        for it in items:
-            hidden_attr = ' data-hidden="1"' if it["hidden"] else ""
-            esc_rel = html.escape(it["rel_path"], quote=True)
-            esc_raw_name = html.escape(it["name"], quote=True)
-            rows_html.append(
-                f'<tr class="item-row"{hidden_attr} '
-                f'data-isdir="{it["is_dir"]}" '
-                f'data-name="{html.escape(it["name"].lower(), quote=True)}" '
-                f'data-rawname="{esc_raw_name}" '
-                f'data-path="{esc_rel}" '
-                f'data-size="{it["size"]}" '
-                f'data-mtime="{it["mtime"]:.0f}">'
-                f'<td class="col-check">'
-                f'<input type="checkbox" class="row-check" value="{esc_rel}" aria-label="Select {esc_raw_name}">'
-                f"</td>"
-                f'<td class="col-name">'
-                f'<a href="{it["href"]}" class="row-link {it["css_class"]}">'
-                f'<span class="badge badge-{it["css_class"]}">{it["badge"]}</span>'
-                f'<span class="fname">{html.escape(it["display_name"])}</span>'
-                f"</a></td>"
-                f'<td class="col-size">{it["size_str"]}</td>'
-                f'<td class="col-date">{it["mtime_str"]}</td>'
-                f"</tr>"
-            )
-
-        rows_str = "\n".join(rows_html)
-        enc = sys.getfilesystemencoding()
-        title = html.escape(url_path)
-        current_dir_js = json.dumps(url_path)
-
-        page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} — Termux HTTP</title>
-<style>
-  :root {{
-    --bg: #0c0e12;
-    --surface: #131720;
-    --surface-hover: #1b2230;
-    --surface-Selected: rgba(56, 189, 248, 0.10);
-    --border: #232b3a;
-    --text: #e2e8f0;
-    --muted: #64748b;
-    --accent: #22c55e;
-    --danger: #ef4444;
-    --dir: #38bdf8;
-    --code: #4ade80;
-    --media: #c084fc;
-    --img: #f472b6;
-    --pkg: #fb923c;
-    --doc: #facc15;
-    --link: #2dd4bf;
-    --file: #cbd5e1;
-  }}
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    background: var(--bg);
-    color: var(--text);
-    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 14px;
-    line-height: 1.5;
-    padding-bottom: 84px;
-  }}
-  /* Sticky Top Breadcrumb + Toolbar */
-  dge-dir">UP</span><span class="fname">.. (Parent Directory)</span></a></td>'
-                f'<td class="col-size">—</td>'
-                f'<td class="col-date">—</td>'
-                f"</tr>"
-            )
-
-        for it in items:
-            hidden_attr = ' data-hidden="1"' if it["hidden"] else ""
-            rows_html.append(
-                f'<tr class="item-row"{hidden_attr} '
-                f'data-isdir="{it["is_dir"]}" '
-                f'data-name="{html.escape(it["name"].lower())}" '
-                f'data-size="{it["size"]}" '
-                f'data-mtime="{it["mtime"]:.0f}">'
-                f'<td class="col-name">'
-                f'<a href="{it["href"]}" class="row-link {it["css_class"]}">'
-                f'<span class="badge badge-{it["css_class"]}">{it["badge"]}</span>'
-                f'<span class="fname">{html.escape(it["display_name"])}</span>'
-                f"</a></td>"
-                f'<td class="col-size">{it["size_str"]}</td>'
-                f'<td class="col-date">{it["mtime_str"]}</td>'
-                f"</tr>"
-            )
-
-        rows_str = "\n".join(rows_html)
-        enc = sys.getfilesystemencoding()
-        title = html.escape(url_path)
-
-        page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} — Termux HTTP</title>
-<style>
-  :root {{
-    --bg: #0c0e12;
-    --surface: #131720;
-    --surface-hover: #1b2230;
-    --border: #232b3a;
-    --text: #e2e8f0;
-    --muted: #64748b;
-    --accent: #22c55e;
-    --dir: #38bdf8;
-    --code: #4ade80;
-    --media: #c084fc;
-    --img: #f472b6;
-    --pkg: #fb923c;
-    --doc: #facc15;
-    --link: #2dd4bf;
-    --file: #cbd5e1;
-  }}
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    background: var(--bg);
-    color: var(--text);
-    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 14px;
-    line-height: 1.5;
-    padding-bottom: 48px;
   }}
   /* Sticky Top Breadcrumb + Toolbar */
   header {{
     position: sticky;
     top: 0;
-    z-index: 20;
-    background: rgba(12, 14, 18, 0.92);
+    z-index: 30;
+    background: rgba(12, 14, 18, 0.94);
     backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--border);
     padding: 10px 16px;
@@ -1032,6 +532,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     gap: 4px;
     font-size: 14px;
     overflow-x: auto;
+    flex: 1;
+    min-width: 180px;
   }}
   .crumb {{
     color: var(--dir);
@@ -1062,17 +564,17 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     display: flex;
     align-items: center;
     gap: 8px;
-    flex-wrap: wrap;
+    position: relative;
   }}
   .search-input {{
     background: var(--surface);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 5px 10px;
+    padding: 6px 10px;
     font-family: inherit;
     font-size: 13px;
-    width: 190px;
+    width: 185px;
     outline: none;
   }}
   .search-input:focus {{
@@ -1083,23 +585,146 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 5px 10px;
+    padding: 6px 11px;
     font-family: inherit;
-    font-size: 12px;
+    font-size: 12.5px;
     cursor: pointer;
-    transition: border-color 0.15s, background 0.15s;
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
   }}
-  .btn:hover {{
+  .btn:hover:not(:disabled) {{
     background: var(--surface-hover);
     border-color: var(--muted);
   }}
-  .btn.active {{
-    border-color: var(--accent);
+  .btn:disabled {{
+    opacity: 0.4;
+    cursor: not-allowed;
+  }}
+  .btn-primary {{
+    border-color: rgba(34, 197, 94, 0.5);
     color: var(--accent);
+  }}
+  .btn-primary:hover:not(:disabled) {{
+    border-color: var(--accent);
+    background: rgba(34, 197, 94, 0.12);
+  }}
+  .btn-danger {{
+    border-color: rgba(239, 68, 68, 0.45);
+    color: var(--danger);
+  }}
+  .btn-danger:hover:not(:disabled) {{
+    border-color: var(--danger);
+    background: rgba(239, 68, 68, 0.12);
+  }}
+  /* Hamburger Menu */
+  .menu-wrap {{
+    position: relative;
+  }}
+  .hamburger-btn {{
+    font-size: 16px;
+    line-height: 1;
+    padding: 6px 10px;
+  }}
+  .dropdown-menu {{
+    display: none;
+    position: absolute;
+    right: 0;
+    top: calc(100% + 6px);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    min-width: 210px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.65);
+    padding: 6px;
+    z-index: 50;
+  }}
+  .dropdown-menu.open {{
+    display: block;
+  }}
+  .menu-item {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: 5px;
+    cursor: pointer;
+    text-align: left;
+  }}
+  .menu-item:hover {{
+    background: var(--surface-hover);
+  }}
+  .menu-divider {{
+    height: 1px;
+    background: var(--border);
+    margin: 5px 0;
+  }}
+  .dot-indicator {{
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(100, 116, 139, 0.2);
+    color: var(--muted);
+  }}
+  .dot-indicator.on {{
+    background: rgba(34, 197, 94, 0.18);
+    color: var(--accent);
+    font-weight: 700;
+  }}
+  /* Clipboard Paste Banner + Action Bar */
+  .sub-bars {{
+    max-width: 1100px;
+    margin: 10px auto 0;
+    padding: 0 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }}
+  .bar-panel {{
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+  }}
+  .bar-panel.visible {{
+    display: flex;
+  }}
+  .clipboard-bar {{
+    border-color: rgba(56, 189, 248, 0.45);
+    background: rgba(19, 23, 32, 0.95);
+  }}
+  .selection-bar {{
+    border-color: rgba(34, 197, 94, 0.45);
+  }}
+  .bar-info {{
+    font-size: 13px;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }}
+  .bar-actions {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
   }}
   main {{
     max-width: 1100px;
-    margin: 14px auto 0;
+    margin: 12px auto 0;
     padding: 0 16px;
   }}
   .stats-bar {{
@@ -1111,6 +736,40 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     margin-bottom: 8px;
     padding: 0 4px;
   }}
+  /* Storage Footer Bar below File List */
+  .footer-bar {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 10px;
+    padding: 0 4px;
+  }}
+  .storage-info {{
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+  }}
+  .storage-meter {{
+    width: 96px;
+    height: 7px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }}
+  .storage-fill {{
+    height: 100%;
+    border-radius: 999px;
+    transition: width 0.25s ease;
+  }}
+  .fill-ok {{ background: var(--accent); }}
+  .fill-warn {{ background: var(--pkg); }}
+  .fill-high {{ background: var(--danger); }}
   .table-wrap {{
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1133,18 +792,44 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     user-select: none;
     white-space: nowrap;
   }}
-  th:hover {{
+  /* Checkboxes hidden by default until Select Mode is activated */
+  th.col-check,
+  td.col-check {{
+    display: none;
+    width: 40px;
+    text-align: center;
+    padding: 0 6px 0 12px;
+  }}
+  th.col-check {{
+    padding: 10px 6px 10px 12px;
+    cursor: default;
+  }}
+  body.select-mode th.col-check,
+  body.select-mode td.col-check {{
+    display: table-cell;
+  }}
+  th:hover:not(.col-check) {{
     color: var(--text);
   }}
   td {{
     border-bottom: 1px solid rgba(35, 43, 58, 0.55);
     padding: 0;
   }}
+  input[type="checkbox"] {{
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent);
+    cursor: pointer;
+    vertical-align: middle;
+  }}
   tr:last-child td {{
     border-bottom: none;
   }}
   tr:hover td {{
     background: var(--surface-hover);
+  }}
+  tr.selected td {{
+    background: var(--surface-selected);
   }}
   .row-link {{
     display: flex;
@@ -1154,6 +839,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     text-decoration: none;
     color: var(--file);
     word-break: break-all;
+  }}
+  body.select-mode .row-link {{
+    padding-left: 6px;
   }}
   .col-size, .col-date {{
     padding: 9px 12px;
@@ -1199,7 +887,61 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   .ft-file .fname {{ color: var(--file); }}
   .badge-ft-file {{ color: var(--muted); background: rgba(100, 116, 139, 0.12); border-color: rgba(100, 116, 139, 0.25); }}
 
-  .upload-form {{ display: inline-flex; align-items: center; gap: 6px; }}
+  /* Modal Dialog */
+  .modal-backdrop {{
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.72);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }}
+  .modal-backdrop.open {{
+    display: flex;
+  }}
+  .modal {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    width: 100%;
+    max-width: 420px;
+    padding: 18px;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.75);
+  }}
+  .modal-title {{
+    font-size: 15px;
+    font-weight: 700;
+    margin-bottom: 10px;
+    color: var(--text);
+  }}
+  .modal-desc {{
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 12px;
+    word-break: break-all;
+  }}
+  .modal-input {{
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 13.5px;
+    margin-bottom: 14px;
+    outline: none;
+  }}
+  .modal-input:focus {{
+    border-color: var(--accent);
+  }}
+  .modal-actions {{
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }}
   @media (max-width: 640px) {{
     .col-date {{ display: none; }}
     .search-input {{ width: 135px; }}
@@ -1213,25 +955,71 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       {breadcrumb_bar}
     </nav>
     <div class="controls">
-      <input type="search" id="filterInput" class="search-input" placeholder="Filter files (/)..." autocomplete="off">
-      <button type="button" id="toggleDotBtn" class="btn" title="Toggle dotfiles">.dotfiles</button>
-      <form class="upload-form" method="POST" enctype="multipart/form-data">
-        <label class="btn" for="fileUpload">+ Upload</label>
-        <input type="file" id="fileUpload" name="file" multiple style="display:none" onchange="this.form.submit()">
+      <input type="search" id="filterInput" class="search-input" placeholder="Filter (/)" autocomplete="off">
+      <div class="menu-wrap">
+        <button type="button" id="hamburgerBtn" class="btn hamburger-btn" aria-label="Menu" title="Menu">☰</button>
+        <div id="dropdownMenu" class="dropdown-menu">
+          <button type="button" class="menu-item" id="menuSelectBtn">
+            <span>Select</span>
+            <span id="selectStateBadge" class="dot-indicator">OFF</span>
+          </button>
+          <button type="button" class="menu-item" id="menuUploadBtn">
+            <span>+ Upload Files</span>
+          </button>
+          <button type="button" class="menu-item" id="menuNewFolderBtn">
+            <span>+ New Folder</span>
+          </button>
+          <div class="menu-divider"></div>
+          <button type="button" class="menu-item" id="toggleDotBtn">
+            <span>Show .dotfiles</span>
+            <span id="dotStateBadge" class="dot-indicator on">ON</span>
+          </button>
+        </div>
+      </div>
+      <form id="uploadForm" method="POST" enctype="multipart/form-data" style="display:none">
+        <input type="file" id="fileUpload" name="file" multiple>
       </form>
     </div>
   </div>
 </header>
 
+<div class="sub-bars">
+  <!-- Selection Manipulation Bar (shown when Select Mode is active) -->
+  <div id="selectionBar" class="bar-panel selection-bar">
+    <div class="bar-info">
+      <strong id="selectedCountText">0 items selected</strong>
+    </div>
+    <div class="bar-actions">
+      <button type="button" class="btn" id="actCopyBtn" title="Copy selected to clipboard" disabled>Copy</button>
+      <button type="button" class="btn" id="actMoveBtn" title="Cut selected to move" disabled>Move</button>
+      <button type="button" class="btn" id="actRenameBtn" title="Rename single selected item" disabled>Rename</button>
+      <button type="button" class="btn btn-danger" id="actDeleteBtn" title="Delete selected items" disabled>Delete</button>
+      <button type="button" class="btn" id="actExitSelectBtn" title="Exit Select Mode">Done</button>
+    </div>
+  </div>
+
+  <!-- Persistent Cross-Folder Clipboard Bar -->
+  <div id="clipboardBar" class="bar-panel clipboard-bar">
+    <div class="bar-info">
+      <span id="clipboardText">Clipboard empty</span>
+    </div>
+    <div class="bar-actions">
+      <button type="button" class="btn btn-primary" id="pasteHereBtn">Paste Here</button>
+      <button type="button" class="btn" id="clearClipboardBtn">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <main>
   <div class="stats-bar">
     <span>{dir_count} folders, {file_count} files</span>
-    <span id="visibleCount"></span>
+    <span id="statusMsg"></span>
   </div>
   <div class="table-wrap">
     <table id="fileTable">
       <thead>
         <tr>
+          <th class="col-check"><input type="checkbox" id="selectAllCheck" title="Select all visible"></th>
           <th data-sort="name">Name ▲</th>
           <th data-sort="size" class="col-size">Size</th>
           <th data-sort="mtime" class="col-date">Modified</th>
@@ -1242,24 +1030,129 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       </tbody>
     </table>
   </div>
+  <div class="footer-bar">
+    <div class="storage-info" title="{used_str} used ({used_pct:.1f}%)">
+      <div class="storage-meter">
+        <div class="storage-fill {fill_class}" style="width: {min(max(used_pct, 0.0), 100.0):.1f}%"></div>
+      </div>
+      <span>{free_str} free / {total_str} total ({used_pct:.0f}% used)</span>
+    </div>
+  </div>
 </main>
+
+<!-- Modal for Rename / New Folder / Delete Confirm -->
+<div id="modalBackdrop" class="modal-backdrop">
+  <div class="modal">
+    <div id="modalTitle" class="modal-title">Action</div>
+    <div id="modalDesc" class="modal-desc"></div>
+    <input type="text" id="modalInput" class="modal-input" autocomplete="off">
+    <div class="modal-actions">
+      <button type="button" class="btn" id="modalCancelBtn">Cancel</button>
+      <button type="button" class="btn btn-primary" id="modalConfirmBtn">Confirm</button>
+    </div>
+  </div>
+</div>
 
 <script>
 (() => {{
+  const CURRENT_DIR = {current_dir_js};
+  const CLIPBOARD_KEY = 'termux_http_clipboard_v1';
+  const DOTFILES_KEY = 'termux_http_dotfiles_v1';
+
   const filterInput = document.getElementById('filterInput');
+  const hamburgerBtn = document.getElementById('hamburgerBtn');
+  const dropdownMenu = document.getElementById('dropdownMenu');
+  const menuSelectBtn = document.getElementById('menuSelectBtn');
+  const selectStateBadge = document.getElementById('selectStateBadge');
+  const menuUploadBtn = document.getElementById('menuUploadBtn');
+  const menuNewFolderBtn = document.getElementById('menuNewFolderBtn');
+  const fileUpload = document.getElementById('fileUpload');
+  const uploadForm = document.getElementById('uploadForm');
   const toggleDotBtn = document.getElementById('toggleDotBtn');
+  const dotStateBadge = document.getElementById('dotStateBadge');
+
   const tbody = document.getElementById('fileBody');
   const rows = Array.from(tbody.querySelectorAll('.item-row'));
   const headers = Array.from(document.querySelectorAll('th[data-sort]'));
-  let showDotfiles = false;
+  const selectAllCheck = document.getElementById('selectAllCheck');
+
+  const selectionBar = document.getElementById('selectionBar');
+  const selectedCountText = document.getElementById('selectedCountText');
+  const actCopyBtn = document.getElementById('actCopyBtn');
+  const actMoveBtn = document.getElementById('actMoveBtn');
+  const actRenameBtn = document.getElementById('actRenameBtn');
+  const actDeleteBtn = document.getElementById('actDeleteBtn');
+  const actExitSelectBtn = document.getElementById('actExitSelectBtn');
+
+  const clipboardBar = document.getElementById('clipboardBar');
+  const clipboardText = document.getElementById('clipboardText');
+  const pasteHereBtn = document.getElementById('pasteHereBtn');
+  const clearClipboardBtn = document.getElementById('clearClipboardBtn');
+
+  const modalBackdrop = document.getElementById('modalBackdrop');
+  const modalTitle = document.getElementById('modalTitle');
+  const modalDesc = document.getElementById('modalDesc');
+  const modalInput = document.getElementById('modalInput');
+  const modalCancelBtn = document.getElementById('modalCancelBtn');
+  const modalConfirmBtn = document.getElementById('modalConfirmBtn');
+
+  let showDotfiles = localStorage.getItem(DOTFILES_KEY) !== '0';
+  let selectMode = false;
   let sortKey = 'name';
   let sortAsc = true;
+  let modalHandler = null;
 
-  toggleDotBtn.classList.toggle('active', showDotfiles); applyFilter();
+  // Hamburger menu logic
+  hamburgerBtn.addEventListener('click', (e) => {{
+    e.stopPropagation();
+    dropdownMenu.classList.toggle('open');
+  }});
+  document.addEventListener('click', (e) => {{
+    if (!dropdownMenu.contains(e.target) && e.target !== hamburgerBtn) {{
+      dropdownMenu.classList.remove('open');
+    }}
+  }});
+
+  // Select Mode toggle
+  function setSelectMode(enabled) {{
+    selectMode = Boolean(enabled);
+    document.body.classList.toggle('select-mode', selectMode);
+    selectionBar.classList.toggle('visible', selectMode);
+    selectStateBadge.textContent = selectMode ? 'ON' : 'OFF';
+    selectStateBadge.classList.toggle('on', selectMode);
+    if (!selectMode) {{
+      rows.forEach(r => {{
+        const cb = r.querySelector('.row-check');
+        if (cb) cb.checked = false;
+      }});
+    }}
+    updateSelectionUI();
+  }}
+
+  menuSelectBtn.addEventListener('click', () => {{
+    dropdownMenu.classList.remove('open');
+    setSelectMode(!selectMode);
+  }});
+
+  actExitSelectBtn.addEventListener('click', () => {{
+    setSelectMode(false);
+  }});
+
+  menuUploadBtn.addEventListener('click', () => {{
+    dropdownMenu.classList.remove('open');
+    fileUpload.click();
+  }});
+  fileUpload.addEventListener('change', () => {{
+    if (fileUpload.files.length > 0) uploadForm.submit();
+  }});
+
+  function syncDotfilesUI() {{
+    dotStateBadge.textContent = showDotfiles ? 'ON' : 'OFF';
+    dotStateBadge.classList.toggle('on', showDotfiles);
+  }}
 
   function applyFilter() {{
     const q = filterInput.value.trim().toLowerCase();
-    let shown = 0;
     for (const r of rows) {{
       const isHidden = r.dataset.hidden === '1';
       const name = r.dataset.name || '';
@@ -1267,28 +1160,277 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       const matchQuery = !q || name.includes(q);
       const visible = matchDot && matchQuery;
       r.style.display = visible ? '' : 'none';
-      if (visible) shown++;
     }}
+    updateSelectionUI();
   }}
 
-  filterInput.addEventListener('input', applyFilter);
   toggleDotBtn.addEventListener('click', () => {{
     showDotfiles = !showDotfiles;
-    toggleDotBtn.classList.toggle('active', showDotfiles);
+    localStorage.setItem(DOTFILES_KEY, showDotfiles ? '1' : '0');
+    syncDotfilesUI();
     applyFilter();
   }});
 
-  window.addEventListener('keydown', (e) => {{
-    if (e.key === '/' && document.activeElement !== filterInput) {{
-      e.preventDefault();
-      filterInput.focus();
-    }} else if (e.key === 'Escape' && document.activeElement === filterInput) {{
-      filterInput.value = '';
-      filterInput.blur();
-      applyFilter();
+  filterInput.addEventListener('input', applyFilter);
+
+  // Selection logic
+  function getVisibleRows() {{
+    return rows.filter(r => r.style.display !== 'none');
+  }}
+
+  function getSelectedRows() {{
+    return rows.filter(r => {{
+      const cb = r.querySelector('.row-check');
+      return cb && cb.checked;
+    }});
+  }}
+
+  function updateSelectionUI() {{
+    const selected = getSelectedRows();
+    const visible = getVisibleRows();
+    rows.forEach(r => {{
+      const cb = r.querySelector('.row-check');
+      r.classList.toggle('selected', Boolean(selectMode && cb && cb.checked));
+    }});
+    const count = selected.length;
+    selectedCountText.textContent = `${{count}} item${{count === 1 ? '' : 's'}} selected`;
+    actCopyBtn.disabled = count === 0;
+    actMoveBtn.disabled = count === 0;
+    actDeleteBtn.disabled = count === 0;
+    actRenameBtn.disabled = count !== 1;
+    selectAllCheck.checked = visible.length > 0 && visible.every(r => r.querySelector('.row-check').checked);
+    selectAllCheck.indeterminate = count > 0 && !selectAllCheck.checked;
+  }}
+
+  rows.forEach(r => {{
+    const cb = r.querySelector('.row-check');
+    const link = r.querySelector('.row-link');
+    cb.addEventListener('change', updateSelectionUI);
+    // When Select Mode is active, tapping a file/folder row toggles its checkbox
+    link.addEventListener('click', (e) => {{
+      if (selectMode) {{
+        e.preventDefault();
+        cb.checked = !cb.checked;
+        updateSelectionUI();
+      }}
+    }});
+  }});
+
+  selectAllCheck.addEventListener('change', () => {{
+    const checked = selectAllCheck.checked;
+    getVisibleRows().forEach(r => {{
+      r.querySelector('.row-check').checked = checked;
+    }});
+    updateSelectionUI();
+  }});
+
+  // Clipboard state (Copy / Move across folders)
+  function getClipboard() {{
+    try {{
+      const raw = sessionStorage.getItem(CLIPBOARD_KEY);
+      return raw ? JSON.parse(raw) : null;
+    }} catch {{
+      return null;
+    }}
+  }}
+
+  function setClipboard(mode, items) {{
+    sessionStorage.setItem(CLIPBOARD_KEY, JSON.stringify({{ mode, items }}));
+    renderClipboardBar();
+  }}
+
+  function clearClipboard() {{
+    sessionStorage.removeItem(CLIPBOARD_KEY);
+    renderClipboardBar();
+  }}
+
+  function renderClipboardBar() {{
+    const clip = getClipboard();
+    if (!clip || !Array.isArray(clip.items) || clip.items.length === 0) {{
+      clipboardBar.classList.remove('visible');
+      return;
+    }}
+    const verb = clip.mode === 'move' ? 'queued to move' : 'copied';
+    clipboardText.textContent = `${{clip.items.length}} item(s) ${{verb}} — navigate to target folder and tap Paste Here`;
+    pasteHereBtn.textContent = clip.mode === 'move' ? 'Move Here' : 'Paste Here';
+    clipboardBar.classList.add('visible');
+  }}
+
+  actCopyBtn.addEventListener('click', () => {{
+    const paths = getSelectedRows().map(r => r.dataset.path);
+    if (!paths.length) return;
+    setClipboard('copy', paths);
+    setSelectMode(false);
+  }});
+
+  actMoveBtn.addEventListener('click', () => {{
+    const paths = getSelectedRows().map(r => r.dataset.path);
+    if (!paths.length) return;
+    setClipboard('move', paths);
+    setSelectMode(false);
+  }});
+
+  clearClipboardBtn.addEventListener('click', clearClipboard);
+
+  async function apiCall(payload) {{
+    const res = await fetch(window.location.pathname, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(payload),
+    }});
+    const data = await res.json();
+    if (!res.ok || !data.ok) {{
+      throw new Error(data.error || 'Operation failed');
+    }}
+    return data;
+  }}
+
+  pasteHereBtn.addEventListener('click', async () => {{
+    const clip = getClipboard();
+    if (!clip || !clip.items.length) return;
+    pasteHereBtn.disabled = true;
+    try {{
+      await apiCall({{
+        action: clip.mode,
+        items: clip.items,
+        dest_dir: CURRENT_DIR,
+      }});
+      clearClipboard();
+      window.location.reload();
+    }} catch (err) {{
+      alert(err.message);
+      pasteHereBtn.disabled = false;
     }}
   }});
 
+  // Modal helpers
+  function openModal({{ title, desc, defaultValue = '', showInput = true, danger = false, confirmLabel = 'Confirm', onConfirm }}) {{
+    modalTitle.textContent = title;
+    modalDesc.textContent = desc;
+    modalInput.style.display = showInput ? 'block' : 'none';
+    modalInput.value = defaultValue;
+    modalConfirmBtn.textContent = confirmLabel;
+    modalConfirmBtn.className = danger ? 'btn btn-danger' : 'btn btn-primary';
+    modalHandler = onConfirm;
+    modalBackdrop.classList.add('open');
+    if (showInput) {{
+      setTimeout(() => {{
+        modalInput.focus();
+        const dotIdx = defaultValue.lastIndexOf('.');
+        if (dotIdx > 0) {{
+          modalInput.setSelectionRange(0, dotIdx);
+        }} else {{
+          modalInput.select();
+        }}
+      }}, 20);
+    }}
+  }}
+
+  function closeModal() {{
+    modalBackdrop.classList.remove('open');
+    modalHandler = null;
+  }}
+
+  modalCancelBtn.addEventListener('click', closeModal);
+  modalBackdrop.addEventListener('click', (e) => {{
+    if (e.target === modalBackdrop) closeModal();
+  }});
+  modalConfirmBtn.addEventListener('click', async () => {{
+    if (!modalHandler) return;
+    modalConfirmBtn.disabled = true;
+    try {{
+      await modalHandler(modalInput.value.trim());
+      closeModal();
+      window.location.reload();
+    }} catch (err) {{
+      alert(err.message);
+    }} finally {{
+      modalConfirmBtn.disabled = false;
+    }}
+  }});
+  modalInput.addEventListener('keydown', (e) => {{
+    if (e.key === 'Enter') {{
+      e.preventDefault();
+      modalConfirmBtn.click();
+    }} else if (e.key === 'Escape') {{
+      closeModal();
+    }}
+  }});
+
+  // Rename action
+  actRenameBtn.addEventListener('click', () => {{
+    const sel = getSelectedRows();
+    if (sel.length !== 1) return;
+    const row = sel[0];
+    const oldName = row.dataset.rawname;
+    const srcPath = row.dataset.path;
+    openModal({{
+      title: 'Rename Item',
+      desc: `Enter a new name for "${{oldName}}":`,
+      defaultValue: oldName,
+      showInput: true,
+      confirmLabel: 'Rename',
+      onConfirm: async (newName) => {{
+        if (!newName || newName === oldName) return;
+        await apiCall({{ action: 'rename', src: srcPath, new_name: newName }});
+      }},
+    }});
+  }});
+
+  // Delete action
+  actDeleteBtn.addEventListener('click', () => {{
+    const sel = getSelectedRows();
+    if (!sel.length) return;
+    const names = sel.map(r => r.dataset.rawname).slice(0, 5).join(', ');
+    const more = sel.length > 5 ? ` and ${{sel.length - 5}} more` : '';
+    openModal({{
+      title: `Delete ${{sel.length}} Item${{sel.length === 1 ? '' : 's'}}?`,
+      desc: `Permanently delete ${{names}}${{more}}? This cannot be undone.`,
+      showInput: false,
+      danger: true,
+      confirmLabel: 'Delete',
+      onConfirm: async () => {{
+        await apiCall({{ action: 'delete', items: sel.map(r => r.dataset.path) }});
+      }},
+    }});
+  }});
+
+  // New Folder action inside hamburger menu
+  menuNewFolderBtn.addEventListener('click', () => {{
+    dropdownMenu.classList.remove('open');
+    openModal({{
+      title: 'New Folder',
+      desc: `Create a folder inside ${{CURRENT_DIR}}:`,
+      defaultValue: '',
+      showInput: true,
+      confirmLabel: 'Create',
+      onConfirm: async (folderName) => {{
+        if (!folderName) throw new Error('Folder name is required');
+        await apiCall({{ action: 'mkdir', dir: CURRENT_DIR, name: folderName }});
+      }},
+    }});
+  }});
+
+  // Keyboard shortcuts
+  window.addEventListener('keydown', (e) => {{
+    if (modalBackdrop.classList.contains('open')) return;
+    if (e.key === '/' && document.activeElement !== filterInput) {{
+      e.preventDefault();
+      filterInput.focus();
+    }} else if (e.key === 'Escape') {{
+      if (document.activeElement === filterInput) {{
+        filterInput.value = '';
+        filterInput.blur();
+        applyFilter();
+      }} else if (dropdownMenu.classList.contains('open')) {{
+        dropdownMenu.classList.remove('open');
+      }} else if (selectMode) {{
+        setSelectMode(false);
+      }}
+    }}
+  }});
+
+  // Sorting
   headers.forEach(th => {{
     th.addEventListener('click', () => {{
       const key = th.dataset.sort;
@@ -1317,6 +1459,11 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       rows.forEach(r => tbody.appendChild(r));
     }});
   }});
+
+  // Initialize state
+  syncDotfilesUI();
+  applyFilter();
+  renderClipboardBar();
 }})();
 </script>
 </body>
@@ -1343,19 +1490,20 @@ def get_lan_ip() -> str:
 
 
 def main():
+    global SERVER_ROOT
     parser = argparse.ArgumentParser(description="Termux Dark Minimalist HTTP File Server")
     parser.add_argument("port", nargs="?", type=int, default=8000, help="Port to listen on (default: 8000)")
     parser.add_argument("-d", "--directory", default=os.getcwd(), help="Directory to serve (default: current dir)")
     parser.add_argument("-b", "--bind", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     args = parser.parse_args()
 
-    target_dir = os.path.abspath(os.path.expanduser(args.directory))
-    os.chdir(target_dir)
+    SERVER_ROOT = os.path.abspath(os.path.expanduser(args.directory))
+    os.chdir(SERVER_ROOT)
 
     lan_ip = get_lan_ip()
     with ThreadingHTTPServer((args.bind, args.port), TermuxHTTPRequestHandler) as httpd:
         print(f"\033[1;32m● Termux HTTP Server running\033[0m")
-        print(f"  \033[1;36mDirectory:\033[0m {target_dir}")
+        print(f"  \033[1;36mDirectory:\033[0m {SERVER_ROOT}")
         print(f"  \033[1;36mLocal:\033[0m     http://127.0.0.1:{args.port}/")
         print(f"  \033[1;36mNetwork:\033[0m   http://{lan_ip}:{args.port}/")
         print(f"  \033[0;90mPress Ctrl+C to stop\033[0m")
