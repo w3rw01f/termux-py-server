@@ -4,9 +4,11 @@ termux_server.py — Lightweight, zero-dependency HTTP file server for Termux.
 Features:
   - Termux-inspired dark minimalist UI with monospace typography
   - Sticky breadcrumb navigation bar at the top
+  - Hamburger menu housing Upload, New Folder, and .dotfiles toggle
+  - Multi-select checkboxes + batch file operations (Delete, Copy, Move, Rename)
+  - Persistent cross-folder clipboard bar (Copy/Cut items, navigate via breadcrumbs, Paste Here)
   - Color-coded badges and filenames by filetype (Folders, Code, Media, Images, Archives, Docs)
-  - Instant client-side search filter, column sorting, and drag-and-drop file upload
-  - HTTP Range request support (206 Partial Content) for smooth video/audio streaming
+  - Instant client-side search filter, column sorting, and HTTP Range streaming (206 Partial Content)
 
 Usage in Termux:
   python termux_server.py [port] [-d DIRECTORY]
@@ -16,7 +18,7 @@ import argparse
 import datetime
 import html
 import io
-import mimetypes
+import json
 import os
 import posixpath
 import re
@@ -26,6 +28,8 @@ import sys
 import urllib.parse
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+SERVER_ROOT = os.getcwd()
 
 FILE_CATEGORIES = {
     "code": {
@@ -92,12 +96,45 @@ def human_size(num_bytes: int) -> str:
     return f"{num_bytes:.1f} TB"
 
 
+def resolve_safe_path(rel_url_path: str) -> str:
+    """Resolve a URL-style relative path safely inside SERVER_ROOT."""
+    cleaned = urllib.parse.unquote(rel_url_path or "/").lstrip("/")
+    norm_rel = os.path.normpath(cleaned) if cleaned else "."
+    target = os.path.abspath(os.path.join(SERVER_ROOT, norm_rel))
+    if os.path.commonpath([SERVER_ROOT, target]) != SERVER_ROOT:
+        raise ValueError("Path escapes root directory")
+    return target
+
+
+def unique_dest_path(dest_dir: str, basename: str) -> str:
+    """Return a non-colliding path inside dest_dir, appending ' (copy N)' if needed."""
+    candidate = os.path.join(dest_dir, basename)
+    if not os.path.exists(candidate) and not os.path.islink(candidate):
+        return candidate
+    stem, ext = os.path.splitext(basename)
+    counter = 1
+    while True:
+        new_name = f"{stem} (copy {counter}){ext}" if counter > 1 else f"{stem} (copy){ext}"
+        candidate = os.path.join(dest_dir, new_name)
+        if not os.path.exists(candidate) and not os.path.islink(candidate):
+            return candidate
+        counter += 1
+
+
 class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
-    server_version = "TermuxHTTP/1.0"
+    server_version = "TermuxHTTP/2.0"
 
     def end_headers(self):
         self.send_header("Accept-Ranges", "bytes")
         super().end_headers()
+
+    def send_json(self, status: int, payload: dict):
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self):
         range_header = self.headers.get("Range")
@@ -109,15 +146,20 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
-        """Handle simple multipart file uploads to the current directory."""
+        content_type = self.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            self.handle_api_action()
+            return
+        if "multipart/form-data" in content_type:
+            self.handle_file_upload(content_type)
+            return
+        self.send_error(HTTPStatus.BAD_REQUEST, "Unsupported Content-Type")
+
+    def handle_file_upload(self, content_type: str):
+        """Handle multipart file uploads to the current directory."""
         path = self.translate_path(self.path)
         if not os.path.isdir(path):
             self.send_error(HTTPStatus.BAD_REQUEST, "Target path is not a directory")
-            return
-
-        content_type = self.headers.get("Content-Type", "")
-        if "multipart/form-data" not in content_type:
-            self.send_error(HTTPStatus.BAD_REQUEST, "Expected multipart/form-data")
             return
 
         boundary_match = re.search(r"boundary=([^;]+)", content_type)
@@ -130,7 +172,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         body = self.rfile.read(content_length)
 
         parts = body.split(b"--" + boundary)
-        saved_count = 0
         for part in parts:
             if b"Content-Disposition" not in part:
                 continue
@@ -148,11 +189,111 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
             dest = os.path.join(path, filename)
             with open(dest, "wb") as f:
                 f.write(file_data)
-            saved_count += 1
 
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", self.path)
         self.end_headers()
+
+    def handle_api_action(self):
+        """Handle JSON file manipulation operations: delete, rename, copy, move, mkdir."""
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(content_length).decode("utf-8")
+            data = json.loads(raw) if raw else {}
+        except Exception as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Invalid JSON: {exc}"})
+            return
+
+        action = data.get("action")
+        try:
+            if action == "delete":
+                items = data.get("items", [])
+                if not items:
+                    raise ValueError("No items specified for deletion")
+                deleted = 0
+                for rel in items:
+                    target = resolve_safe_path(rel)
+                    if target == SERVER_ROOT:
+                        raise ValueError("Cannot delete server root directory")
+                    if os.path.islink(target) or os.path.isfile(target):
+                        os.unlink(target)
+                        deleted += 1
+                    elif os.path.isdir(target):
+                        shutil.rmtree(target)
+                        deleted += 1
+                self.send_json(HTTPStatus.OK, {"ok": True, "deleted": deleted})
+
+            elif action == "rename":
+                src_rel = data.get("src", "")
+                new_name = (data.get("new_name") or "").strip()
+                if not src_rel or not new_name:
+                    raise ValueError("Source and new name are required")
+                if "/" in new_name or "\\" in new_name or new_name in (".", ".."):
+                    raise ValueError("Invalid file or folder name")
+                src_path = resolve_safe_path(src_rel)
+                if src_path == SERVER_ROOT:
+                    raise ValueError("Cannot rename server root")
+                dest_path = os.path.join(os.path.dirname(src_path), new_name)
+                if os.path.exists(dest_path) or os.path.islink(dest_path):
+                    raise ValueError(f"'{new_name}' already exists")
+                os.rename(src_path, dest_path)
+                self.send_json(HTTPStatus.OK, {"ok": True})
+
+            elif action in ("copy", "move"):
+                items = data.get("items", [])
+                dest_rel = data.get("dest_dir", "/")
+                if not items:
+                    raise ValueError("No items selected")
+                dest_dir = resolve_safe_path(dest_rel)
+                if not os.path.isdir(dest_dir):
+                    raise ValueError("Destination directory does not exist")
+
+                processed = 0
+                for rel in items:
+                    src_path = resolve_safe_path(rel)
+                    if src_path == SERVER_ROOT:
+                        raise ValueError("Cannot copy or move root directory")
+                    if not os.path.exists(src_path) and not os.path.islink(src_path):
+                        continue
+                    basename = os.path.basename(src_path.rstrip("/\\"))
+                    if action == "copy":
+                        target_path = unique_dest_path(dest_dir, basename)
+                        if os.path.isdir(src_path) and not os.path.islink(src_path):
+                            if os.path.commonpath([src_path, target_path]) == src_path:
+                                raise ValueError(f"Cannot copy folder '{basename}' into itself")
+                            shutil.copytree(src_path, target_path, symlinks=True)
+                        else:
+                            shutil.copy2(src_path, target_path, follow_symlinks=False)
+                        processed += 1
+                    else:  # move
+                        target_path = os.path.join(dest_dir, basename)
+                        if os.path.abspath(src_path) == os.path.abspath(target_path):
+                            continue
+                        if os.path.exists(target_path) or os.path.islink(target_path):
+                            raise ValueError(f"'{basename}' already exists in destination")
+                        if os.path.isdir(src_path) and os.path.commonpath([src_path, dest_dir]) == src_path:
+                            raise ValueError(f"Cannot move folder '{basename}' into itself")
+                        shutil.move(src_path, target_path)
+                        processed += 1
+
+                self.send_json(HTTPStatus.OK, {"ok": True, "processed": processed})
+
+            elif action == "mkdir":
+                dir_rel = data.get("dir", "/")
+                folder_name = (data.get("name") or "").strip()
+                if not folder_name or "/" in folder_name or "\\" in folder_name or folder_name in (".", ".."):
+                    raise ValueError("Invalid folder name")
+                parent_dir = resolve_safe_path(dir_rel)
+                new_dir = os.path.join(parent_dir, folder_name)
+                if os.path.exists(new_dir):
+                    raise ValueError(f"'{folder_name}' already exists")
+                os.makedirs(new_dir)
+                self.send_json(HTTPStatus.OK, {"ok": True})
+
+            else:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Unknown action: {action}"})
+        except Exception as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
 
     def send_range_response(self, path: str, range_header: str):
         try:
@@ -204,6 +345,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         url_path = urllib.parse.unquote(self.path.split("?", 1)[0])
         if not url_path.startswith("/"):
             url_path = "/" + url_path
+        if not url_path.endswith("/"):
+            url_path += "/"
 
         # Build breadcrumb segments
         segments = [seg for seg in url_path.strip("/").split("/") if seg]
@@ -240,6 +383,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
             badge, css_class = classify_file(name, is_dir, is_link)
             display_name = name + "/" if is_dir else name
             href = urllib.parse.quote(name, errors="surrogatepass") + ("/" if is_dir else "")
+            rel_item_path = posixpath.join(url_path, name)
             size_str = "—" if is_dir else human_size(size)
             mtime_str = (
                 datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
@@ -250,6 +394,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 "name": name,
                 "display_name": display_name,
                 "href": href,
+                "rel_path": rel_item_path,
                 "is_dir": 1 if is_dir else 0,
                 "size": size,
                 "size_str": size_str,
@@ -270,8 +415,81 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 parent_href += "/"
             rows_html.append(
                 f'<tr class="parent-row" data-isdir="2" data-name=".." data-size="-1" data-mtime="0">'
+                f'<td class="col-check"></td>'
                 f'<td class="col-name"><a href="{parent_href}" class="row-link ft-dir">'
                 f'<span class="badge badge-dir">UP</span><span class="fname">.. (Parent Directory)</span></a></td>'
+                f'<td class="col-size">—</td>'
+                f'<td class="col-date">—</td>'
+                f"</tr>"
+            )
+
+        for it in items:
+            hidden_attr = ' data-hidden="1"' if it["hidden"] else ""
+            esc_rel = html.escape(it["rel_path"], quote=True)
+            esc_raw_name = html.escape(it["name"], quote=True)
+            rows_html.append(
+                f'<tr class="item-row"{hidden_attr} '
+                f'data-isdir="{it["is_dir"]}" '
+                f'data-name="{html.escape(it["name"].lower(), quote=True)}" '
+                f'data-rawname="{esc_raw_name}" '
+                f'data-path="{esc_rel}" '
+                f'data-size="{it["size"]}" '
+                f'data-mtime="{it["mtime"]:.0f}">'
+                f'<td class="col-check">'
+                f'<input type="checkbox" class="row-check" value="{esc_rel}" aria-label="Select {esc_raw_name}">'
+                f"</td>"
+                f'<td class="col-name">'
+                f'<a href="{it["href"]}" class="row-link {it["css_class"]}">'
+                f'<span class="badge badge-{it["css_class"]}">{it["badge"]}</span>'
+                f'<span class="fname">{html.escape(it["display_name"])}</span>'
+                f"</a></td>"
+                f'<td class="col-size">{it["size_str"]}</td>'
+                f'<td class="col-date">{it["mtime_str"]}</td>'
+                f"</tr>"
+            )
+
+        rows_str = "\n".join(rows_html)
+        enc = sys.getfilesystemencoding()
+        title = html.escape(url_path)
+        current_dir_js = json.dumps(url_path)
+
+        page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} — Termux HTTP</title>
+<style>
+  :root {{
+    --bg: #0c0e12;
+    --surface: #131720;
+    --surface-hover: #1b2230;
+    --surface-Selected: rgba(56, 189, 248, 0.10);
+    --border: #232b3a;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --accent: #22c55e;
+    --danger: #ef4444;
+    --dir: #38bdf8;
+    --code: #4ade80;
+    --media: #c084fc;
+    --img: #f472b6;
+    --pkg: #fb923c;
+    --doc: #facc15;
+    --link: #2dd4bf;
+    --file: #cbd5e1;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    padding-bottom: 84px;
+  }}
+  /* Sticky Top Breadcrumb + Toolbar */
+  dge-dir">UP</span><span class="fname">.. (Parent Directory)</span></a></td>'
                 f'<td class="col-size">—</td>'
                 f'<td class="col-date">—</td>'
                 f"</tr>"
