@@ -4,19 +4,23 @@ termux_server.py — Lightweight, zero-dependency HTTP file server for Termux.
 Features:
   - Termux-inspired dark minimalist UI with monospace typography
   - Sticky breadcrumb navigation bar at the top
-  - Hamburger menu housing Select mode, Upload, New Folder, and .dotfiles toggle
-  - Hidden-by-default checkboxes; toggling Select reveals checkboxes & command bar (Copy, Move, Rename, Delete)
+  - Hamburger menu: Select mode, + Upload Files, + New Folder, + New Text File, Show .dotfiles (OFF by default)
+  - Hidden-by-default checkboxes; Select mode reveals checkboxes & action bar (Copy, Move, Rename, Edit, Zip, Extract, Delete)
   - Persistent cross-folder clipboard bar (Copy/Cut items, navigate via breadcrumbs, Paste Here)
-  - Storage usage bar below the file list showing free space / total space and fill meter
-  - Color-coded badges and filenames by filetype (Folders, Code, Media, Images, Archives, Docs)
-  - Instant client-side search filter, column sorting, and HTTP Range streaming (206 Partial Content)
+  - Top monochrome upload progress bar + drag-and-drop uploads + streamed multipart disk writes
+  - Bottom storage usage bar showing free space / total space and color-coded fill meter
+  - Inline Text Viewer & Editor modal (with Tab support, Ctrl+S, and auto-open on New Text File)
+  - Image & Media Lightbox modal with Prev/Next navigation and HTTP Range (206 Partial Content) streaming
+  - Optional HTTP Basic Authentication (-a / --auth user:pass)
 
 Usage in Termux:
-  python termux_server.py [port] [-d DIRECTORY]
+  python termux_server.py [port] [-d DIRECTORY] [-a USER:PASS]
 """
 
 import argparse
+import base64
 import datetime
+import hmac
 import html
 import io
 import json
@@ -26,11 +30,27 @@ import re
 import shutil
 import socket
 import sys
+import tarfile
+import tempfile
 import urllib.parse
+import zipfile
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 SERVER_ROOT = os.getcwd()
+SERVER_AUTH_TOKEN = None  # Base64 "user:pass" when --auth is enabled
+
+TEXT_EXTENSIONS = {
+    ".txt", ".md", ".log", ".rst", ".csv", ".tsv", ".py", ".sh", ".bash", ".zsh",
+    ".js", ".mjs", ".ts", ".tsx", ".jsx", ".json", ".html", ".htm", ".css", ".scss",
+    ".c", ".h", ".cpp", ".hpp", ".rs", ".go", ".java", ".kt", ".kts", ".xml",
+    ".yaml", ".yml", ".toml", ".ini", ".conf", ".cfg", ".sql", ".lua", ".rb",
+    ".php", ".vim", ".env", ".gitignore", ".bashrc", ".zshrc", ".properties",
+}
+
+EXTRACTABLE_SUFFIXES = (
+    ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
+)
 
 FILE_CATEGORIES = {
     "code": {
@@ -60,7 +80,7 @@ FILE_CATEGORIES = {
     },
     "archive": {
         "exts": {
-            ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".txz", ".zst",
+            ".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz", ".zst",
             ".7z", ".rar", ".apk", ".deb", ".iso", ".img",
         },
         "badge": "PKG",
@@ -87,6 +107,31 @@ def classify_file(name: str, is_dir: bool, is_link: bool):
         if ext in cat["exts"]:
             return (cat["badge"], cat["class"])
     return ("FILE", "ft-file")
+
+
+def is_text_editable(name: str, is_dir: bool) -> bool:
+    if is_dir:
+        return False
+    lower = name.lower()
+    if lower in TEXT_EXTENSIONS:
+        return True
+    _, ext = os.path.splitext(lower)
+    return ext in TEXT_EXTENSIONS
+
+
+def is_extractable_archive(name: str, is_dir: bool) -> bool:
+    if is_dir:
+        return False
+    lower = name.lower()
+    return any(lower.endswith(sfx) for sfx in EXTRACTABLE_SUFFIXES)
+
+
+def strip_archive_suffix(name: str) -> str:
+    lower = name.lower()
+    for sfx in sorted(EXTRACTABLE_SUFFIXES, key=len, reverse=True):
+        if lower.endswith(sfx):
+            return name[: len(name) - len(sfx)] or "extracted"
+    return os.path.splitext(name)[0] or "extracted"
 
 
 def human_size(num_bytes: int) -> str:
@@ -122,12 +167,49 @@ def unique_dest_path(dest_dir: str, basename: str) -> str:
         counter += 1
 
 
+def safe_extract_archive(archive_path: str, extract_dir: str):
+    """Safely extract zip or tar archives while preventing path traversal."""
+    lower = archive_path.lower()
+    abs_dest = os.path.abspath(extract_dir)
+    if lower.endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for member in zf.infolist():
+                target = os.path.abspath(os.path.join(abs_dest, member.filename))
+                if os.path.commonpath([abs_dest, target]) != abs_dest:
+                    raise ValueError(f"Unsafe path in zip archive: {member.filename}")
+            zf.extractall(abs_dest)
+    else:
+        with tarfile.open(archive_path, "r:*") as tf:
+            for member in tf.getmembers():
+                target = os.path.abspath(os.path.join(abs_dest, member.name))
+                if os.path.commonpath([abs_dest, target]) != abs_dest:
+                    raise ValueError(f"Unsafe path in tar archive: {member.name}")
+            tf.extractall(abs_dest)
+
+
 class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
-    server_version = "TermuxHTTP/2.2"
+    server_version = "TermuxHTTP/3.0"
 
     def end_headers(self):
         self.send_header("Accept-Ranges", "bytes")
         super().end_headers()
+
+    def check_auth(self) -> bool:
+        if not SERVER_AUTH_TOKEN:
+            return True
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Basic "):
+            provided = auth_header[6:].strip()
+            if hmac.compare_digest(provided, SERVER_AUTH_TOKEN):
+                return True
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("WWW-Authenticate", 'Basic realm="Termux HTTP Server"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        msg = b"401 Unauthorized\n"
+        self.send_header("Content-Length", str(len(msg)))
+        self.end_headers()
+        self.wfile.write(msg)
+        return False
 
     def send_json(self, status: int, payload: dict):
         data = json.dumps(payload).encode("utf-8")
@@ -137,7 +219,22 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_HEAD(self):
+        if not self.check_auth():
+            return
+        super().do_HEAD()
+
     def do_GET(self):
+        if not self.check_auth():
+            return
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.query:
+            qs = urllib.parse.parse_qs(parsed.query)
+            if qs.get("action") == ["zip"]:
+                items = qs.get("item", [])
+                self.handle_zip_download(items)
+                return
+
         range_header = self.headers.get("Range")
         if range_header:
             path = self.translate_path(self.path)
@@ -147,6 +244,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self):
+        if not self.check_auth():
+            return
         content_type = self.headers.get("Content-Type", "")
         if "application/json" in content_type:
             self.handle_api_action()
@@ -156,47 +255,146 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
             return
         self.send_error(HTTPStatus.BAD_REQUEST, "Unsupported Content-Type")
 
+    def handle_zip_download(self, items: list):
+        """Package selected files/directories into a streamed temporary .zip archive."""
+        try:
+            if not items:
+                self.send_error(HTTPStatus.BAD_REQUEST, "No items selected for zip")
+                return
+            resolved = []
+            for rel in items:
+                target = resolve_safe_path(rel)
+                if os.path.exists(target):
+                    resolved.append((rel, target))
+            if not resolved:
+                self.send_error(HTTPStatus.NOT_FOUND, "Selected items not found")
+                return
+
+            if len(resolved) == 1:
+                base_label = os.path.basename(resolved[0][1].rstrip("/\\")) or "archive"
+                zip_name = f"{base_label}.zip"
+            else:
+                zip_name = "selected_files.zip"
+
+            with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as tmp_zip:
+                with zipfile.ZipFile(tmp_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for _, full_path in resolved:
+                        base_name = os.path.basename(full_path.rstrip("/\\"))
+                        if os.path.isdir(full_path) and not os.path.islink(full_path):
+                            parent_dir = os.path.dirname(full_path.rstrip("/\\"))
+                            for root, dirs, files in os.walk(full_path):
+                                rel_root = os.path.relpath(root, parent_dir)
+                                if not files and not dirs:
+                                    zf.writestr(rel_root.rstrip("/") + "/", "")
+                                for fname in files:
+                                    fpath = os.path.join(root, fname)
+                                    if os.path.isfile(fpath):
+                                        arcname = os.path.join(rel_root, fname)
+                                        zf.write(fpath, arcname)
+                        elif os.path.isfile(full_path):
+                            zf.write(full_path, base_name)
+
+                size = tmp_zip.tell()
+                tmp_zip.seek(0)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/zip")
+                safe_zip_name = urllib.parse.quote(zip_name)
+                self.send_header(
+                    "Content-Disposition",
+                    f"attachment; filename=\"{zip_name}\"; filename*=UTF-8''{safe_zip_name}",
+                )
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                shutil.copyfileobj(tmp_zip, self.wfile, length=64 * 1024)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+
     def handle_file_upload(self, content_type: str):
-        """Handle multipart file uploads to the current directory."""
+        """Stream multipart/form-data file uploads directly to disk without RAM spikes."""
         path = self.translate_path(self.path)
         if not os.path.isdir(path):
             self.send_error(HTTPStatus.BAD_REQUEST, "Target path is not a directory")
             return
 
-        boundary_match = re.search(r"boundary=([^;]+)", content_type)
+        boundary_match = re.search(r"boundary=([^;\s]+)", content_type)
         if not boundary_match:
             self.send_error(HTTPStatus.BAD_REQUEST, "Missing multipart boundary")
             return
 
-        boundary = boundary_match.group(1).strip('"').encode("utf-8")
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
+        boundary_bytes = boundary_match.group(1).strip('"').encode("utf-8")
+        delim = b"--" + boundary_bytes
+        remaining = int(self.headers.get("Content-Length", 0))
 
-        parts = body.split(b"--" + boundary)
-        for part in parts:
-            if b"Content-Disposition" not in part:
-                continue
-            header_end = part.find(b"\r\n\r\n")
-            if header_end == -1:
-                continue
-            raw_headers = part[:header_end].decode("utf-8", errors="replace")
-            fn_match = re.search(r'filename="([^"]+)"', raw_headers)
-            if not fn_match or not fn_match.group(1):
-                continue
-            filename = os.path.basename(fn_match.group(1))
-            file_data = part[header_end + 4 :]
-            if file_data.endswith(b"\r\n"):
-                file_data = file_data[:-2]
-            dest = os.path.join(path, filename)
-            with open(dest, "wb") as f:
-                f.write(file_data)
+        def read_line() -> bytes:
+            nonlocal remaining
+            if remaining <= 0:
+                return b""
+            line = self.rfile.readline(min(remaining, 65536))
+            remaining -= len(line)
+            return line
+
+        # Advance to first boundary
+        while remaining > 0:
+            line = read_line()
+            if not line:
+                break
+            if line.strip().startswith(delim):
+                break
+
+        while remaining > 0:
+            # Parse part headers
+            headers_raw = []
+            while remaining > 0:
+                line = read_line()
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+                headers_raw.append(line.decode("utf-8", errors="replace"))
+
+            if not headers_raw:
+                break
+
+            header_block = "".join(headers_raw)
+            fn_match = re.search(r'filename="([^"]*)"', header_block)
+            filename = os.path.basename(fn_match.group(1)) if (fn_match and fn_match.group(1)) else None
+
+            out_file = None
+            if filename:
+                dest_path = os.path.join(path, filename)
+                out_file = open(dest_path, "wb")
+
+            # Stream part body until next boundary line, holding trailing \r\n in prev_tail
+            prev_tail = b""
+            try:
+                while remaining > 0:
+                    line = read_line()
+                    if not line:
+                        break
+                    stripped = line.rstrip(b"\r\n")
+                    if stripped == delim or stripped == delim + b"--":
+                        # Trim the CRLF that preceded the boundary
+                        if prev_tail.endswith(b"\r\n"):
+                            prev_tail = prev_tail[:-2]
+                        elif prev_tail.endswith(b"\n"):
+                            prev_tail = prev_tail[:-1]
+                        if out_file and prev_tail:
+                            out_file.write(prev_tail)
+                        prev_tail = b""
+                        break
+                    if out_file and prev_tail:
+                        out_file.write(prev_tail)
+                    prev_tail = line
+            finally:
+                if out_file:
+                    out_file.close()
 
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", self.path)
         self.end_headers()
 
     def handle_api_action(self):
-        """Handle JSON file manipulation operations: delete, rename, copy, move, mkdir."""
+        """Handle JSON file operations: delete, rename, copy, move, mkdir, touch, read_text, write_text, extract."""
         try:
             content_length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(content_length).decode("utf-8")
@@ -291,6 +489,66 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 os.makedirs(new_dir)
                 self.send_json(HTTPStatus.OK, {"ok": True})
 
+            elif action == "touch":
+                dir_rel = data.get("dir", "/")
+                file_name = (data.get("name") or "").strip()
+                if not file_name or "/" in file_name or "\\" in file_name or file_name in (".", ".."):
+                    raise ValueError("Invalid file name")
+                if "." not in file_name:
+                    file_name += ".txt"
+                parent_dir = resolve_safe_path(dir_rel)
+                new_file = os.path.join(parent_dir, file_name)
+                if os.path.exists(new_file) or os.path.islink(new_file):
+                    raise ValueError(f"'{file_name}' already exists")
+                with open(new_file, "w", encoding="utf-8") as f:
+                    f.write("")
+                rel_created = posixpath.join(dir_rel, file_name)
+                self.send_json(HTTPStatus.OK, {"ok": True, "path": rel_created, "name": file_name})
+
+            elif action == "read_text":
+                rel_path = data.get("path", "")
+                target = resolve_safe_path(rel_path)
+                if not os.path.isfile(target):
+                    raise ValueError("File does not exist")
+                size = os.path.getsize(target)
+                if size > 2 * 1024 * 1024:
+                    raise ValueError("File is larger than 2 MB; download to edit locally")
+                with open(target, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                self.send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "path": rel_path, "name": os.path.basename(target), "content": content},
+                )
+
+            elif action == "write_text":
+                rel_path = data.get("path", "")
+                content = data.get("content", "")
+                target = resolve_safe_path(rel_path)
+                if os.path.isdir(target):
+                    raise ValueError("Cannot overwrite a directory with text")
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.send_json(HTTPStatus.OK, {"ok": True})
+
+            elif action == "extract":
+                src_rel = data.get("src", "")
+                src_path = resolve_safe_path(src_rel)
+                if not os.path.isfile(src_path):
+                    raise ValueError("Archive file not found")
+                parent_dir = os.path.dirname(src_path)
+                folder_stem = strip_archive_suffix(os.path.basename(src_path))
+                extract_dir = unique_dest_path(parent_dir, folder_stem)
+                os.makedirs(extract_dir, exist_ok=True)
+                try:
+                    safe_extract_archive(src_path, extract_dir)
+                except Exception:
+                    shutil.rmtree(extract_dir, ignore_errors=True)
+                    raise
+                self.send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "extracted_to": os.path.basename(extract_dir)},
+                )
+
             else:
                 self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Unknown action: {action}"})
         except Exception as exc:
@@ -382,6 +640,15 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 file_count += 1
 
             badge, css_class = classify_file(name, is_dir, is_link)
+            editable = 1 if is_text_editable(name, is_dir) else 0
+            extractable = 1 if is_extractable_archive(name, is_dir) else 0
+            preview_kind = ""
+            if css_class == "ft-img":
+                preview_kind = "image"
+            elif css_class == "ft-media":
+                ext = os.path.splitext(name.lower())[1]
+                preview_kind = "audio" if ext in {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac", ".opus"} else "video"
+
             display_name = name + "/" if is_dir else name
             href = urllib.parse.quote(name, errors="surrogatepass") + ("/" if is_dir else "")
             rel_item_path = posixpath.join(url_path, name)
@@ -397,6 +664,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 "href": href,
                 "rel_path": rel_item_path,
                 "is_dir": 1 if is_dir else 0,
+                "editable": editable,
+                "extractable": extractable,
+                "preview": preview_kind,
                 "size": size,
                 "size_str": size_str,
                 "mtime": mtime,
@@ -431,6 +701,10 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
             rows_html.append(
                 f'<tr class="item-row"{hidden_attr} '
                 f'data-isdir="{it["is_dir"]}" '
+                f'data-editable="{it["editable"]}" '
+                f'data-extractable="{it["extractable"]}" '
+                f'data-preview="{it["preview"]}" '
+                f'data-href="{html.escape(it["href"], quote=True)}" '
                 f'data-name="{html.escape(it["name"].lower(), quote=True)}" '
                 f'data-rawname="{esc_raw_name}" '
                 f'data-path="{esc_rel}" '
@@ -505,6 +779,10 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     font-size: 14px;
     line-height: 1.5;
     padding-bottom: 84px;
+  }}
+  body.drag-over .table-wrap {{
+    border-color: var(--dir);
+    box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25);
   }}
   /* Sticky Top Breadcrumb + Toolbar */
   header {{
@@ -589,6 +867,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     font-family: inherit;
     font-size: 12.5px;
     cursor: pointer;
+    text-decoration: none;
     transition: border-color 0.15s, background 0.15s, color 0.15s;
     display: inline-flex;
     align-items: center;
@@ -636,7 +915,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 8px;
-    min-width: 210px;
+    min-width: 215px;
     box-shadow: 0 10px 28px rgba(0, 0, 0, 0.65);
     padding: 6px;
     z-index: 50;
@@ -731,6 +1010,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     display: flex;
     justify-content: space-between;
     align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
     color: var(--muted);
     font-size: 12px;
     margin-bottom: 8px;
@@ -765,7 +1046,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   .storage-fill {{
     height: 100%;
     border-radius: 999px;
-    transition: width 0.25s ease;
+    transition: width 0.2s ease;
   }}
   .fill-ok {{ background: var(--accent); }}
   .fill-warn {{ background: var(--pkg); }}
@@ -776,6 +1057,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     border: 1px solid var(--border);
     border-radius: 8px;
     overflow: hidden;
+    transition: border-color 0.15s, box-shadow 0.15s;
   }}
   table {{
     width: 100%;
@@ -888,12 +1170,12 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   .ft-file .fname {{ color: var(--file); }}
   .badge-ft-file {{ color: var(--muted); background: rgba(100, 116, 139, 0.12); border-color: rgba(100, 116, 139, 0.25); }}
 
-  /* Modal Dialog */
+  /* Standard Modal Dialog */
   .modal-backdrop {{
     display: none;
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.72);
+    background: rgba(0, 0, 0, 0.76);
     z-index: 100;
     align-items: center;
     justify-content: center;
@@ -907,7 +1189,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     border: 1px solid var(--border);
     border-radius: 10px;
     width: 100%;
-    max-width: 420px;
+    max-width: 440px;
     padding: 18px;
     box-shadow: 0 16px 40px rgba(0, 0, 0, 0.75);
   }}
@@ -932,17 +1214,109 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     padding: 8px 10px;
     font-family: inherit;
     font-size: 13.5px;
-    margin-bottom: 14px;
+    margin-bottom: 12px;
     outline: none;
   }}
   .modal-input:focus {{
     border-color: var(--accent);
+  }}
+  .modal-check-row {{
+    display: none;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text);
+    margin-bottom: 14px;
+    cursor: pointer;
+    user-select: none;
+  }}
+  .modal-check-row.visible {{
+    display: flex;
   }}
   .modal-actions {{
     display: flex;
     justify-content: flex-end;
     gap: 8px;
   }}
+
+  /* Inline Text Viewer & Editor Modal */
+  .editor-modal {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    width: 100%;
+    max-width: 960px;
+    height: min(86vh, 760px);
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.8);
+    overflow: hidden;
+  }}
+  .editor-header, .editor-footer {{
+    padding: 10px 14px;
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }}
+  .editor-header {{ border-bottom: 1px solid var(--border); }}
+  .editor-footer {{ border-top: 1px solid var(--border); font-size: 12px; color: var(--muted); }}
+  .editor-title {{
+    font-weight: 700;
+    color: var(--code);
+    word-break: break-all;
+  }}
+  .editor-textarea {{
+    flex: 1;
+    width: 100%;
+    background: #090b0f;
+    color: var(--text);
+    border: none;
+    padding: 14px;
+    font-family: inherit;
+    font-size: 13.5px;
+    line-height: 1.55;
+    resize: none;
+    outline: none;
+    tab-size: 2;
+  }}
+
+  /* Lightbox Modal for Images & Media */
+  .lightbox-modal {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    width: 100%;
+    max-width: 960px;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.85);
+  }}
+  .lightbox-body {{
+    background: #07080b;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 280px;
+    max-height: 74vh;
+    padding: 12px;
+    overflow: auto;
+  }}
+  .lightbox-body img,
+  .lightbox-body video {{
+    max-width: 100%;
+    max-height: 70vh;
+    border-radius: 6px;
+    object-fit: contain;
+  }}
+  .lightbox-body audio {{
+    width: min(480px, 90%);
+  }}
+
   @media (max-width: 640px) {{
     .col-date {{ display: none; }}
     .search-input {{ width: 135px; }}
@@ -970,10 +1344,13 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
           <button type="button" class="menu-item" id="menuNewFolderBtn">
             <span>+ New Folder</span>
           </button>
+          <button type="button" class="menu-item" id="menuNewTxtBtn">
+            <span>+ New Text File</span>
+          </button>
           <div class="menu-divider"></div>
           <button type="button" class="menu-item" id="toggleDotBtn">
             <span>Show .dotfiles</span>
-            <span id="dotStateBadge" class="dot-indicator on">OFF</span>
+            <span id="dotStateBadge" class="dot-indicator">OFF</span>
           </button>
         </div>
       </div>
@@ -994,6 +1371,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       <button type="button" class="btn" id="actCopyBtn" title="Copy selected to clipboard" disabled>Copy</button>
       <button type="button" class="btn" id="actMoveBtn" title="Cut selected to move" disabled>Move</button>
       <button type="button" class="btn" id="actRenameBtn" title="Rename single selected item" disabled>Rename</button>
+      <button type="button" class="btn" id="actEditBtn" title="Open selected file in text editor" disabled>Edit</button>
+      <button type="button" class="btn" id="actZipBtn" title="Download selected items as .zip" disabled>Zip</button>
+      <button type="button" class="btn" id="actExtractBtn" title="Extract selected archive" disabled>Extract</button>
       <button type="button" class="btn btn-danger" id="actDeleteBtn" title="Delete selected items" disabled>Delete</button>
       <button type="button" class="btn" id="actExitSelectBtn" title="Exit Select Mode">Done</button>
     </div>
@@ -1046,12 +1426,16 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   </div>
 </main>
 
-<!-- Modal for Rename / New Folder / Delete Confirm -->
+<!-- Modal for Rename / New Folder / New Text File / Delete Confirm -->
 <div id="modalBackdrop" class="modal-backdrop">
   <div class="modal">
     <div id="modalTitle" class="modal-title">Action</div>
     <div id="modalDesc" class="modal-desc"></div>
     <input type="text" id="modalInput" class="modal-input" autocomplete="off">
+    <label id="modalCheckRow" class="modal-check-row">
+      <input type="checkbox" id="modalExtraCheck" checked>
+      <span id="modalCheckLabel">Open in editor after creation</span>
+    </label>
     <div class="modal-actions">
       <button type="button" class="btn" id="modalCancelBtn">Cancel</button>
       <button type="button" class="btn btn-primary" id="modalConfirmBtn">Confirm</button>
@@ -1059,11 +1443,46 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   </div>
 </div>
 
+<!-- Modal for Inline Text Viewer & Editor -->
+<div id="editorBackdrop" class="modal-backdrop">
+  <div class="editor-modal">
+    <div class="editor-header">
+      <span id="editorTitle" class="editor-title">file.txt</span>
+      <div class="bar-actions">
+        <a id="editorRawLink" href="#" download class="btn">Download</a>
+        <button type="button" id="editorSaveBtn" class="btn btn-primary">Save</button>
+        <button type="button" id="editorCloseBtn" class="btn">Close</button>
+      </div>
+    </div>
+    <textarea id="editorTextarea" class="editor-textarea" spellcheck="false"></textarea>
+    <div class="editor-footer">
+      <span id="editorStats">0 lines, 0 chars</span>
+      <span id="editorStatus">Ctrl+S to save</span>
+    </div>
+  </div>
+</div>
+
+<!-- Modal for Image & Media Lightbox -->
+<div id="lightboxBackdrop" class="modal-backdrop">
+  <div class="lightbox-modal">
+    <div class="editor-header">
+      <span id="lightboxTitle" class="editor-title">preview</span>
+      <div class="bar-actions">
+        <button type="button" id="lightboxPrevBtn" class="btn">◀ Prev</button>
+        <button type="button" id="lightboxNextBtn" class="btn">Next ▶</button>
+        <a id="lightboxDownloadLink" href="#" download class="btn">Download</a>
+        <button type="button" id="lightboxCloseBtn" class="btn">✕</button>
+      </div>
+    </div>
+    <div id="lightboxBody" class="lightbox-body"></div>
+  </div>
+</div>
+
 <script>
 (() => {{
   const CURRENT_DIR = {current_dir_js};
   const CLIPBOARD_KEY = 'termux_http_clipboard_v1';
-  const DOTFILES_KEY = 'termux_http_dotfiles_v1';
+  const DOTFILES_KEY = 'termux_http_dotfiles_v2';
 
   const filterInput = document.getElementById('filterInput');
   const hamburgerBtn = document.getElementById('hamburgerBtn');
@@ -1072,10 +1491,15 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   const selectStateBadge = document.getElementById('selectStateBadge');
   const menuUploadBtn = document.getElementById('menuUploadBtn');
   const menuNewFolderBtn = document.getElementById('menuNewFolderBtn');
+  const menuNewTxtBtn = document.getElementById('menuNewTxtBtn');
   const fileUpload = document.getElementById('fileUpload');
   const uploadForm = document.getElementById('uploadForm');
   const toggleDotBtn = document.getElementById('toggleDotBtn');
   const dotStateBadge = document.getElementById('dotStateBadge');
+
+  const uploadBar = document.getElementById('uploadBar');
+  const uploadFill = document.getElementById('uploadFill');
+  const uploadText = document.getElementById('uploadText');
 
   const tbody = document.getElementById('fileBody');
   const rows = Array.from(tbody.querySelectorAll('.item-row'));
@@ -1087,6 +1511,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   const actCopyBtn = document.getElementById('actCopyBtn');
   const actMoveBtn = document.getElementById('actMoveBtn');
   const actRenameBtn = document.getElementById('actRenameBtn');
+  const actEditBtn = document.getElementById('actEditBtn');
+  const actZipBtn = document.getElementById('actZipBtn');
+  const actExtractBtn = document.getElementById('actExtractBtn');
   const actDeleteBtn = document.getElementById('actDeleteBtn');
   const actExitSelectBtn = document.getElementById('actExitSelectBtn');
 
@@ -1099,14 +1526,49 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   const modalTitle = document.getElementById('modalTitle');
   const modalDesc = document.getElementById('modalDesc');
   const modalInput = document.getElementById('modalInput');
+  const modalCheckRow = document.getElementById('modalCheckRow');
+  const modalExtraCheck = document.getElementById('modalExtraCheck');
+  const modalCheckLabel = document.getElementById('modalCheckLabel');
   const modalCancelBtn = document.getElementById('modalCancelBtn');
   const modalConfirmBtn = document.getElementById('modalConfirmBtn');
 
-  let showDotfiles = localStorage.getItem(DOTFILES_KEY) !== '1';
+  const editorBackdrop = document.getElementById('editorBackdrop');
+  const editorTitle = document.getElementById('editorTitle');
+  const editorRawLink = document.getElementById('editorRawLink');
+  const editorSaveBtn = document.getElementById('editorSaveBtn');
+  const editorCloseBtn = document.getElementById('editorCloseBtn');
+  const editorTextarea = document.getElementById('editorTextarea');
+  const editorStats = document.getElementById('editorStats');
+  const editorStatus = document.getElementById('editorStatus');
+
+  const lightboxBackdrop = document.getElementById('lightboxBackdrop');
+  const lightboxTitle = document.getElementById('lightboxTitle');
+  const lightboxBody = document.getElementById('lightboxBody');
+  const lightboxPrevBtn = document.getElementById('lightboxPrevBtn');
+  const lightboxNextBtn = document.getElementById('lightboxNextBtn');
+  const lightboxDownloadLink = document.getElementById('lightboxDownloadLink');
+  const lightboxCloseBtn = document.getElementById('lightboxCloseBtn');
+
+  // .dotfiles OFF by default
+  let showDotfiles = localStorage.getItem(DOTFILES_KEY) === '1';
   let selectMode = false;
   let sortKey = 'name';
   let sortAsc = true;
   let modalHandler = null;
+
+  let currentEditorPath = null;
+  let editorDirty = false;
+  let editorReloadOnClose = false;
+
+  let lightboxItems = [];
+  let lightboxIndex = -1;
+
+  function formatBytes(b) {{
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (b >= 1024 && i < units.length - 1) {{ b /= 1024; i++; }}
+    return (i === 0 ? b.toFixed(0) : b.toFixed(1)) + ' ' + units[i];
+  }}
 
   // Hamburger menu logic
   hamburgerBtn.addEventListener('click', (e) => {{
@@ -1144,27 +1606,14 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     setSelectMode(false);
   }});
 
-  const uploadBar = document.getElementById('uploadBar');
-  const uploadFill = document.getElementById('uploadFill');
-  const uploadText = document.getElementById('uploadText');
-
-  function formatBytes(b) {{
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let i = 0;
-    while (b >= 1024 && i < units.length - 1) {{ b /= 1024; i++; }}
-    return (i === 0 ? b.toFixed(0) : b.toFixed(1)) + ' ' + units[i];
-  }}
-
-  menuUploadBtn.addEventListener('click', () => {{
-    dropdownMenu.classList.remove('open');
-    fileUpload.click();
-  }});
-
-  fileUpload.addEventListener('change', () => {{
-    if (!fileUpload.files.length) return;
-    const formData = new FormData(uploadForm);
+  // Upload files with top progress bar (via button or drag & drop)
+  function uploadFileList(files) {{
+    if (!files || !files.length) return;
+    const formData = new FormData();
+    for (const f of files) {{
+      formData.append('file', f);
+    }}
     const xhr = new XMLHttpRequest();
-
     uploadBar.style.display = 'inline-flex';
     uploadFill.style.width = '0%';
     uploadText.textContent = 'Uploading...';
@@ -1192,6 +1641,41 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
     xhr.open('POST', window.location.pathname);
     xhr.send(formData);
+  }}
+
+  menuUploadBtn.addEventListener('click', () => {{
+    dropdownMenu.classList.remove('open');
+    fileUpload.click();
+  }});
+  fileUpload.addEventListener('change', () => {{
+    if (fileUpload.files.length > 0) uploadFileList(fileUpload.files);
+  }});
+
+  // Drag & Drop upload anywhere on window
+  let dragCounter = 0;
+  window.addEventListener('dragenter', (e) => {{
+    if (e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files')) {{
+      e.preventDefault();
+      dragCounter++;
+      document.body.classList.add('drag-over');
+    }}
+  }});
+  window.addEventListener('dragover', (e) => {{
+    if (e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files')) {{
+      e.preventDefault();
+    }}
+  }});
+  window.addEventListener('dragleave', () => {{
+    dragCounter = Math.max(0, dragCounter - 1);
+    if (dragCounter === 0) document.body.classList.remove('drag-over');
+  }});
+  window.addEventListener('drop', (e) => {{
+    dragCounter = 0;
+    document.body.classList.remove('drag-over');
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {{
+      e.preventDefault();
+      uploadFileList(e.dataTransfer.files);
+    }}
   }});
 
   function syncDotfilesUI() {{
@@ -1244,8 +1728,11 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     selectedCountText.textContent = `${{count}} item${{count === 1 ? '' : 's'}} selected`;
     actCopyBtn.disabled = count === 0;
     actMoveBtn.disabled = count === 0;
+    actZipBtn.disabled = count === 0;
     actDeleteBtn.disabled = count === 0;
     actRenameBtn.disabled = count !== 1;
+    actEditBtn.disabled = !(count === 1 && selected[0].dataset.isdir === '0');
+    actExtractBtn.disabled = !(count === 1 && selected[0].dataset.extractable === '1');
     selectAllCheck.checked = visible.length > 0 && visible.every(r => r.querySelector('.row-check').checked);
     selectAllCheck.indeterminate = count > 0 && !selectAllCheck.checked;
   }}
@@ -1254,12 +1741,20 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     const cb = r.querySelector('.row-check');
     const link = r.querySelector('.row-link');
     cb.addEventListener('change', updateSelectionUI);
-    // When Select Mode is active, tapping a file/folder row toggles its checkbox
     link.addEventListener('click', (e) => {{
       if (selectMode) {{
         e.preventDefault();
         cb.checked = !cb.checked;
         updateSelectionUI();
+        return;
+      }}
+      // Normal mode: intercept text/code files for inline editor, and images/media for lightbox
+      if (r.dataset.editable === '1') {{
+        e.preventDefault();
+        openEditor(r.dataset.path, r.dataset.rawname, r.dataset.href, false);
+      }} else if (r.dataset.preview) {{
+        e.preventDefault();
+        openLightboxForRow(r);
       }}
     }});
   }});
@@ -1351,12 +1846,210 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     }}
   }});
 
-  // Modal helpers
-  function openModal({{ title, desc, defaultValue = '', showInput = true, danger = false, confirmLabel = 'Confirm', onConfirm }}) {{
+  // Zip download action
+  actZipBtn.addEventListener('click', () => {{
+    const paths = getSelectedRows().map(r => r.dataset.path);
+    if (!paths.length) return;
+    const params = new URLSearchParams({{ action: 'zip' }});
+    paths.forEach(p => params.append('item', p));
+    window.location.href = `${{window.location.pathname}}?${{params.toString()}}`;
+    setSelectMode(false);
+  }});
+
+  // Archive extract action
+  actExtractBtn.addEventListener('click', async () => {{
+    const sel = getSelectedRows();
+    if (sel.length !== 1) return;
+    actExtractBtn.disabled = true;
+    try {{
+      await apiCall({{ action: 'extract', src: sel[0].dataset.path }});
+      window.location.reload();
+    }} catch (err) {{
+      alert(err.message);
+      actExtractBtn.disabled = false;
+    }}
+  }});
+
+  // Edit button in Select Bar
+  actEditBtn.addEventListener('click', () => {{
+    const sel = getSelectedRows();
+    if (sel.length !== 1) return;
+    const r = sel[0];
+    setSelectMode(false);
+    openEditor(r.dataset.path, r.dataset.rawname, r.dataset.href, false);
+  }});
+
+  // Inline Text Viewer / Editor functions
+  function updateEditorStats() {{
+    const val = editorTextarea.value;
+    const lines = val ? val.split('\\n').length : 0;
+    editorStats.textContent = `${{lines}} line${{lines === 1 ? '' : 's'}}, ${{val.length}} chars`;
+  }}
+
+  async function openEditor(relPath, displayName, rawHref, reloadOnClose) {{
+    try {{
+      const data = await apiCall({{ action: 'read_text', path: relPath }});
+      currentEditorPath = relPath;
+      editorReloadOnClose = Boolean(reloadOnClose);
+      editorDirty = false;
+      editorTitle.textContent = data.name || displayName;
+      editorRawLink.href = rawHref || encodeURIComponent(data.name);
+      editorTextarea.value = data.content || '';
+      editorStatus.textContent = 'Ctrl+S to save';
+      updateEditorStats();
+      editorBackdrop.classList.add('open');
+      setTimeout(() => editorTextarea.focus(), 20);
+    }} catch (err) {{
+      alert(err.message);
+    }}
+  }}
+
+  async function saveEditorContent() {{
+    if (!currentEditorPath) return;
+    editorSaveBtn.disabled = true;
+    editorStatus.textContent = 'Saving...';
+    try {{
+      await apiCall({{
+        action: 'write_text',
+        path: currentEditorPath,
+        content: editorTextarea.value,
+      }});
+      editorDirty = false;
+      editorReloadOnClose = true;
+      editorTitle.textContent = editorTitle.textContent.replace(/\\*$/, '');
+      editorStatus.textContent = 'Saved ✓';
+    }} catch (err) {{
+      alert(err.message);
+      editorStatus.textContent = 'Save failed';
+    }} finally {{
+      editorSaveBtn.disabled = false;
+    }}
+  }}
+
+  function closeEditor() {{
+    if (editorDirty && !confirm('Discard unsaved changes?')) return;
+    editorBackdrop.classList.remove('open');
+    currentEditorPath = null;
+    if (editorReloadOnClose) {{
+      window.location.reload();
+    }}
+  }}
+
+  editorTextarea.addEventListener('input', () => {{
+    if (!editorDirty) {{
+      editorDirty = true;
+      if (!editorTitle.textContent.endsWith('*')) {{
+        editorTitle.textContent += '*';
+      }}
+    }}
+    editorStatus.textContent = 'Unsaved changes';
+    updateEditorStats();
+  }});
+
+  editorTextarea.addEventListener('keydown', (e) => {{
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {{
+      e.preventDefault();
+      saveEditorContent();
+    }} else if (e.key === 'Tab') {{
+      e.preventDefault();
+      const start = editorTextarea.selectionStart;
+      const end = editorTextarea.selectionEnd;
+      editorTextarea.setRangeText('  ', start, end, 'end');
+      editorTextarea.dispatchEvent(new Event('input'));
+    }}
+  }});
+
+  editorSaveBtn.addEventListener('click', saveEditorContent);
+  editorCloseBtn.addEventListener('click', closeEditor);
+  editorBackdrop.addEventListener('click', (e) => {{
+    if (e.target === editorBackdrop) closeEditor();
+  }});
+
+  // Lightbox functions (Images, Video, Audio)
+  function openLightboxForRow(targetRow) {{
+    lightboxItems = getVisibleRows().filter(r => Boolean(r.dataset.preview));
+    lightboxIndex = lightboxItems.indexOf(targetRow);
+    if (lightboxIndex === -1) return;
+    renderLightboxItem();
+    lightboxBackdrop.classList.add('open');
+  }}
+
+  function renderLightboxItem() {{
+    if (lightboxIndex < 0 || lightboxIndex >= lightboxItems.length) return;
+    const r = lightboxItems[lightboxIndex];
+    const kind = r.dataset.preview;
+    const href = r.dataset.href;
+    const name = r.dataset.rawname;
+
+    lightboxTitle.textContent = `${{name}} (${{lightboxIndex + 1}}/${{lightboxItems.length}})`;
+    lightboxDownloadLink.href = href;
+    lightboxPrevBtn.disabled = lightboxItems.length <= 1;
+    lightboxNextBtn.disabled = lightboxItems.length <= 1;
+    lightboxBody.innerHTML = '';
+
+    if (kind === 'image') {{
+      const img = document.createElement('img');
+      img.src = href;
+      img.alt = name;
+      lightboxBody.appendChild(img);
+    }} else if (kind === 'video') {{
+      const vid = document.createElement('video');
+      vid.src = href;
+      vid.controls = true;
+      vid.autoplay = true;
+      lightboxBody.appendChild(vid);
+    }} else if (kind === 'audio') {{
+      const aud = document.createElement('audio');
+      aud.src = href;
+      aud.controls = true;
+      aud.autoplay = true;
+      lightboxBody.appendChild(aud);
+    }}
+  }}
+
+  function closeLightbox() {{
+    lightboxBody.innerHTML = '';
+    lightboxBackdrop.classList.remove('open');
+    lightboxIndex = -1;
+  }}
+
+  lightboxPrevBtn.addEventListener('click', () => {{
+    if (!lightboxItems.length) return;
+    lightboxIndex = (lightboxIndex - 1 + lightboxItems.length) % lightboxItems.length;
+    renderLightboxItem();
+  }});
+
+  lightboxNextBtn.addEventListener('click', () => {{
+    if (!lightboxItems.length) return;
+    lightboxIndex = (lightboxIndex + 1) % lightboxItems.length;
+    renderLightboxItem();
+  }});
+
+  lightboxCloseBtn.addEventListener('click', closeLightbox);
+  lightboxBackdrop.addEventListener('click', (e) => {{
+    if (e.target === lightboxBackdrop) closeLightbox();
+  }});
+
+  // Modal helpers (Rename, New Folder, New Text File, Delete)
+  function openModal({{
+    title,
+    desc,
+    defaultValue = '',
+    showInput = true,
+    showCheckbox = false,
+    checkboxLabel = 'Open in editor after creation',
+    checkboxDefault = true,
+    danger = false,
+    confirmLabel = 'Confirm',
+    onConfirm,
+  }}) {{
     modalTitle.textContent = title;
     modalDesc.textContent = desc;
     modalInput.style.display = showInput ? 'block' : 'none';
     modalInput.value = defaultValue;
+    modalCheckRow.classList.toggle('visible', Boolean(showCheckbox));
+    modalCheckLabel.textContent = checkboxLabel;
+    modalExtraCheck.checked = Boolean(checkboxDefault);
     modalConfirmBtn.textContent = confirmLabel;
     modalConfirmBtn.className = danger ? 'btn btn-danger' : 'btn btn-primary';
     modalHandler = onConfirm;
@@ -1387,9 +2080,11 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     if (!modalHandler) return;
     modalConfirmBtn.disabled = true;
     try {{
-      await modalHandler(modalInput.value.trim());
+      const shouldReload = await modalHandler(modalInput.value.trim(), modalExtraCheck.checked);
       closeModal();
-      window.location.reload();
+      if (shouldReload !== false) {{
+        window.location.reload();
+      }}
     }} catch (err) {{
       alert(err.message);
     }} finally {{
@@ -1419,7 +2114,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       showInput: true,
       confirmLabel: 'Rename',
       onConfirm: async (newName) => {{
-        if (!newName || newName === oldName) return;
+        if (!newName || newName === oldName) return false;
         await apiCall({{ action: 'rename', src: srcPath, new_name: newName }});
       }},
     }});
@@ -1459,8 +2154,42 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     }});
   }});
 
+  // New Text File action inside hamburger menu (with "Open in editor" checkbox ON by default)
+  menuNewTxtBtn.addEventListener('click', () => {{
+    dropdownMenu.classList.remove('open');
+    openModal({{
+      title: 'New Text File',
+      desc: `Enter file name (defaults to .txt if no extension is given):`,
+      defaultValue: 'untitled.txt',
+      showInput: true,
+      showCheckbox: true,
+      checkboxLabel: 'Open in editor after creation',
+      checkboxDefault: true,
+      confirmLabel: 'Create',
+      onConfirm: async (rawName, openAfter) => {{
+        if (!rawName) throw new Error('File name is required');
+        const res = await apiCall({{ action: 'touch', dir: CURRENT_DIR, name: rawName }});
+        if (openAfter) {{
+          await openEditor(res.path, res.name, encodeURIComponent(res.name), true);
+          return false; // Wait until editor closes to reload list
+        }}
+        return true;
+      }},
+    }});
+  }});
+
   // Keyboard shortcuts
   window.addEventListener('keydown', (e) => {{
+    if (editorBackdrop.classList.contains('open')) {{
+      if (e.key === 'Escape') closeEditor();
+      return;
+    }}
+    if (lightboxBackdrop.classList.contains('open')) {{
+      if (e.key === 'Escape') closeLightbox();
+      else if (e.key === 'ArrowLeft') lightboxPrevBtn.click();
+      else if (e.key === 'ArrowRight') lightboxNextBtn.click();
+      return;
+    }}
     if (modalBackdrop.classList.contains('open')) return;
     if (e.key === '/' && document.activeElement !== filterInput) {{
       e.preventDefault();
@@ -1538,15 +2267,19 @@ def get_lan_ip() -> str:
 
 
 def main():
-    global SERVER_ROOT
+    global SERVER_ROOT, SERVER_AUTH_TOKEN
     parser = argparse.ArgumentParser(description="Termux Dark Minimalist HTTP File Server")
     parser.add_argument("port", nargs="?", type=int, default=8000, help="Port to listen on (default: 8000)")
     parser.add_argument("-d", "--directory", default=os.getcwd(), help="Directory to serve (default: current dir)")
     parser.add_argument("-b", "--bind", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("-a", "--auth", default=None, help="Optional Basic Auth credentials in USER:PASS format")
     args = parser.parse_args()
 
     SERVER_ROOT = os.path.abspath(os.path.expanduser(args.directory))
     os.chdir(SERVER_ROOT)
+
+    if args.auth:
+        SERVER_AUTH_TOKEN = base64.b64encode(args.auth.encode("utf-8")).decode("ascii")
 
     lan_ip = get_lan_ip()
     with ThreadingHTTPServer((args.bind, args.port), TermuxHTTPRequestHandler) as httpd:
@@ -1554,6 +2287,8 @@ def main():
         print(f"  \033[1;36mDirectory:\033[0m {SERVER_ROOT}")
         print(f"  \033[1;36mLocal:\033[0m     http://127.0.0.1:{args.port}/")
         print(f"  \033[1;36mNetwork:\033[0m   http://{lan_ip}:{args.port}/")
+        if SERVER_AUTH_TOKEN:
+            print(f"  \033[1;33mAuth:\033[0m      Basic Auth enabled")
         print(f"  \033[0;90mPress Ctrl+C to stop\033[0m")
         try:
             httpd.serve_forever()
