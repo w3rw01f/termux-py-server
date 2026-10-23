@@ -972,7 +972,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
           <div class="menu-divider"></div>
           <button type="button" class="menu-item" id="toggleDotBtn">
             <span>Show .dotfiles</span>
-            <span id="dotStateBadge" class="dot-indicator on">ON</span>
+            <span id="dotStateBadge" class="dot-indicator on">OFF</span>
           </button>
         </div>
       </div>
@@ -1096,7 +1096,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   const modalCancelBtn = document.getElementById('modalCancelBtn');
   const modalConfirmBtn = document.getElementById('modalConfirmBtn');
 
-  let showDotfiles = localStorage.getItem(DOTFILES_KEY) !== '0';
+  let showDotfiles = localStorage.getItem(DOTFILES_KEY) !== '1';
   let selectMode = false;
   let sortKey = 'name';
   let sortAsc = true;
