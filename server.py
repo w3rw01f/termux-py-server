@@ -1,3 +1,6 @@
+termux_server.py
+
+
 #!/usr/bin/env python3
 """
 termux_server.py — Lightweight, zero-dependency HTTP file server for Termux.
@@ -9,8 +12,8 @@ Features:
   - Persistent cross-folder clipboard bar (Copy/Cut items, navigate via breadcrumbs, Paste Here)
   - Top monochrome upload progress bar + drag-and-drop uploads + streamed multipart disk writes
   - Bottom storage usage bar showing free space / total space and color-coded fill meter
-  - Inline Text Viewer & Editor modal (with Tab support, Ctrl+S, and auto-open on New Text File)
-  - Image & Media Lightbox modal with Prev/Next navigation and HTTP Range (206 Partial Content) streaming
+  - Inline Text Viewer & Editor modal (with Open in browser button, live cursor Ln/Col indicator, Tab support, Ctrl+S, and auto-open on New Text File)
+  - Image & Media Lightbox modal with Prev / Open / Next buttons, Download icon, Fullscreen mode, and Left/Right edge tap zones
   - Optional HTTP Basic Authentication (-a / --auth user:pass)
 
 Usage in Termux:
@@ -188,7 +191,7 @@ def safe_extract_archive(archive_path: str, extract_dir: str):
 
 
 class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
-    server_version = "TermuxHTTP/3.0"
+    server_version = "TermuxHTTP/3.1"
 
     def end_headers(self):
         self.send_header("Accept-Ranges", "bytes")
@@ -871,8 +874,22 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     transition: border-color 0.15s, background 0.15s, color 0.15s;
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 6px;
     white-space: nowrap;
+  }}
+  .btn-icon {{
+    padding: 6px 9px;
+  }}
+  .btn svg {{
+    width: 15px;
+    height: 15px;
+    stroke: currentColor;
+    stroke-width: 2;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    display: block;
   }}
   .btn:hover:not(:disabled) {{
     background: var(--surface-hover);
@@ -1282,6 +1299,16 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     outline: none;
     tab-size: 2;
   }}
+  .editor-footer-left {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }}
+  .cursor-pos {{
+    color: var(--dir);
+    font-weight: 600;
+  }}
 
   /* Lightbox Modal for Images & Media */
   .lightbox-modal {{
@@ -1296,15 +1323,32 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     overflow: hidden;
     box-shadow: 0 18px 48px rgba(0, 0, 0, 0.85);
   }}
+  .lightbox-modal:fullscreen,
+  .lightbox-modal.is-fullscreen {{
+    max-width: 100vw;
+    max-height: 100vh;
+    width: 100vw;
+    height: 100vh;
+    border-radius: 0;
+    border: none;
+  }}
   .lightbox-body {{
+    position: relative;
     background: #07080b;
     display: flex;
     align-items: center;
     justify-content: center;
     min-height: 280px;
     max-height: 74vh;
+    flex: 1;
     padding: 12px;
-    overflow: auto;
+    overflow: hidden;
+    user-select: none;
+  }}
+  .lightbox-modal:fullscreen .lightbox-body,
+  .lightbox-modal.is-fullscreen .lightbox-body {{
+    max-height: calc(100vh - 54px);
+    height: calc(100vh - 54px);
   }}
   .lightbox-body img,
   .lightbox-body video {{
@@ -1312,9 +1356,60 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     max-height: 70vh;
     border-radius: 6px;
     object-fit: contain;
+    z-index: 1;
+  }}
+  .lightbox-modal:fullscreen .lightbox-body img,
+  .lightbox-modal:fullscreen .lightbox-body video,
+  .lightbox-modal.is-fullscreen .lightbox-body img,
+  .lightbox-modal.is-fullscreen .lightbox-body video {{
+    max-height: calc(100vh - 78px);
   }}
   .lightbox-body audio {{
     width: min(480px, 90%);
+    z-index: 1;
+  }}
+  /* Left & Right Edge Tap Zones for Media Navigation */
+  .edge-tap-zone {{
+    position: absolute;
+    top: 0;
+    bottom: 56px;
+    width: 22%;
+    z-index: 5;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    opacity: 0;
+    transition: opacity 0.15s ease, background 0.15s ease;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  .edge-tap-zone.edge-left {{
+    left: 0;
+    justify-content: flex-start;
+    padding-left: 14px;
+    background: linear-gradient(90deg, rgba(0, 0, 0, 0.35), transparent);
+  }}
+  .edge-tap-zone.edge-right {{
+    right: 0;
+    justify-content: flex-end;
+    padding-right: 14px;
+    background: linear-gradient(270deg, rgba(0, 0, 0, 0.35), transparent);
+  }}
+  .edge-tap-zone:hover,
+  .edge-tap-zone:active {{
+    opacity: 1;
+  }}
+  .edge-chevron {{
+    color: rgba(226, 232, 240, 0.75);
+    font-size: 20px;
+    font-weight: 700;
+    background: rgba(19, 23, 32, 0.7);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    width: 34px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }}
 
   @media (max-width: 640px) {{
@@ -1449,14 +1544,20 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     <div class="editor-header">
       <span id="editorTitle" class="editor-title">file.txt</span>
       <div class="bar-actions">
-        <a id="editorRawLink" href="#" download class="btn">Download</a>
+        <a id="editorOpenLink" href="#" target="_blank" rel="noopener" class="btn" title="Open file directly in browser">Open</a>
+        <a id="editorRawLink" href="#" download class="btn btn-icon" title="Download file" aria-label="Download file">
+          <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </a>
         <button type="button" id="editorSaveBtn" class="btn btn-primary">Save</button>
         <button type="button" id="editorCloseBtn" class="btn">Close</button>
       </div>
     </div>
     <textarea id="editorTextarea" class="editor-textarea" spellcheck="false"></textarea>
     <div class="editor-footer">
-      <span id="editorStats">0 lines, 0 chars</span>
+      <div class="editor-footer-left">
+        <span id="editorCursorPos" class="cursor-pos">Ln 1, Col 1</span>
+        <span id="editorStats">0 lines, 0 chars</span>
+      </div>
       <span id="editorStatus">Ctrl+S to save</span>
     </div>
   </div>
@@ -1464,17 +1565,31 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
 <!-- Modal for Image & Media Lightbox -->
 <div id="lightboxBackdrop" class="modal-backdrop">
-  <div class="lightbox-modal">
+  <div id="lightboxModal" class="lightbox-modal">
     <div class="editor-header">
       <span id="lightboxTitle" class="editor-title">preview</span>
       <div class="bar-actions">
-        <button type="button" id="lightboxPrevBtn" class="btn">◀ Prev</button>
-        <button type="button" id="lightboxNextBtn" class="btn">Next ▶</button>
-        <a id="lightboxDownloadLink" href="#" download class="btn">Download</a>
-        <button type="button" id="lightboxCloseBtn" class="btn">✕</button>
+        <button type="button" id="lightboxPrevBtn" class="btn" title="Previous media">◀ Prev</button>
+        <a id="lightboxOpenLink" href="#" target="_blank" rel="noopener" class="btn" title="Open media directly in browser">Open</a>
+        <button type="button" id="lightboxNextBtn" class="btn" title="Next media">Next ▶</button>
+        <a id="lightboxDownloadLink" href="#" download class="btn btn-icon" title="Download file" aria-label="Download file">
+          <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </a>
+        <button type="button" id="lightboxFullscreenBtn" class="btn btn-icon" title="Toggle Fullscreen" aria-label="Toggle Fullscreen">
+          <svg viewBox="0 0 24 24"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+        </button>
+        <button type="button" id="lightboxCloseBtn" class="btn" title="Close">✕</button>
       </div>
     </div>
-    <div id="lightboxBody" class="lightbox-body"></div>
+    <div id="lightboxBody" class="lightbox-body">
+      <div id="edgeTapLeft" class="edge-tap-zone edge-left" title="Previous">
+        <span class="edge-chevron">‹</span>
+      </div>
+      <div id="lightboxMediaSlot"></div>
+      <div id="edgeTapRight" class="edge-tap-zone edge-right" title="Next">
+        <span class="edge-chevron">›</span>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1534,19 +1649,27 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
   const editorBackdrop = document.getElementById('editorBackdrop');
   const editorTitle = document.getElementById('editorTitle');
+  const editorOpenLink = document.getElementById('editorOpenLink');
   const editorRawLink = document.getElementById('editorRawLink');
   const editorSaveBtn = document.getElementById('editorSaveBtn');
   const editorCloseBtn = document.getElementById('editorCloseBtn');
   const editorTextarea = document.getElementById('editorTextarea');
+  const editorCursorPos = document.getElementById('editorCursorPos');
   const editorStats = document.getElementById('editorStats');
   const editorStatus = document.getElementById('editorStatus');
 
   const lightboxBackdrop = document.getElementById('lightboxBackdrop');
+  const lightboxModal = document.getElementById('lightboxModal');
   const lightboxTitle = document.getElementById('lightboxTitle');
   const lightboxBody = document.getElementById('lightboxBody');
+  const lightboxMediaSlot = document.getElementById('lightboxMediaSlot');
+  const edgeTapLeft = document.getElementById('edgeTapLeft');
+  const edgeTapRight = document.getElementById('edgeTapRight');
   const lightboxPrevBtn = document.getElementById('lightboxPrevBtn');
+  const lightboxOpenLink = document.getElementById('lightboxOpenLink');
   const lightboxNextBtn = document.getElementById('lightboxNextBtn');
   const lightboxDownloadLink = document.getElementById('lightboxDownloadLink');
+  const lightboxFullscreenBtn = document.getElementById('lightboxFullscreenBtn');
   const lightboxCloseBtn = document.getElementById('lightboxCloseBtn');
 
   // .dotfiles OFF by default
@@ -1882,8 +2005,30 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   // Inline Text Viewer / Editor functions
   function updateEditorStats() {{
     const val = editorTextarea.value;
-    const lines = val ? val.split('\\n').length : 0;
+    const lines = val ? val.split('\\n').length : 1;
     editorStats.textContent = `${{lines}} line${{lines === 1 ? '' : 's'}}, ${{val.length}} chars`;
+    updateEditorCursorPos();
+  }}
+
+  function updateEditorCursorPos() {{
+    const val = editorTextarea.value;
+    const start = editorTextarea.selectionStart || 0;
+    const end = editorTextarea.selectionEnd || 0;
+    const upToStart = val.slice(0, start).split('\\n');
+    const startLine = upToStart.length;
+    const startCol = upToStart[upToStart.length - 1].length + 1;
+
+    if (end > start) {{
+      const upToEnd = val.slice(0, end).split('\\n');
+      const endLine = upToEnd.length;
+      if (endLine !== startLine) {{
+        editorCursorPos.textContent = `Ln ${{startLine}}–${{endLine}} (${{endLine - startLine + 1}} lines selected)`;
+        return;
+      }}
+      editorCursorPos.textContent = `Ln ${{startLine}}, Col ${{startCol}} (${{end - start}} selected)`;
+      return;
+    }}
+    editorCursorPos.textContent = `Ln ${{startLine}}, Col ${{startCol}}`;
   }}
 
   async function openEditor(relPath, displayName, rawHref, reloadOnClose) {{
@@ -1892,13 +2037,19 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       currentEditorPath = relPath;
       editorReloadOnClose = Boolean(reloadOnClose);
       editorDirty = false;
+      const targetHref = rawHref || encodeURIComponent(data.name);
       editorTitle.textContent = data.name || displayName;
-      editorRawLink.href = rawHref || encodeURIComponent(data.name);
+      editorOpenLink.href = targetHref;
+      editorRawLink.href = targetHref;
       editorTextarea.value = data.content || '';
+      editorTextarea.setSelectionRange(0, 0);
       editorStatus.textContent = 'Ctrl+S to save';
       updateEditorStats();
       editorBackdrop.classList.add('open');
-      setTimeout(() => editorTextarea.focus(), 20);
+      setTimeout(() => {{
+        editorTextarea.focus();
+        updateEditorCursorPos();
+      }}, 20);
     }} catch (err) {{
       alert(err.message);
     }}
@@ -1946,6 +2097,10 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     updateEditorStats();
   }});
 
+  ['click', 'keyup', 'select', 'focus'].forEach(evt => {{
+    editorTextarea.addEventListener(evt, updateEditorCursorPos);
+  }});
+
   editorTextarea.addEventListener('keydown', (e) => {{
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {{
       e.preventDefault();
@@ -1980,51 +2135,79 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     const kind = r.dataset.preview;
     const href = r.dataset.href;
     const name = r.dataset.rawname;
+    const hasMultiple = lightboxItems.length > 1;
 
     lightboxTitle.textContent = `${{name}} (${{lightboxIndex + 1}}/${{lightboxItems.length}})`;
+    lightboxOpenLink.href = href;
     lightboxDownloadLink.href = href;
-    lightboxPrevBtn.disabled = lightboxItems.length <= 1;
-    lightboxNextBtn.disabled = lightboxItems.length <= 1;
-    lightboxBody.innerHTML = '';
+    lightboxPrevBtn.disabled = !hasMultiple;
+    lightboxNextBtn.disabled = !hasMultiple;
+    edgeTapLeft.style.display = hasMultiple ? 'flex' : 'none';
+    edgeTapRight.style.display = hasMultiple ? 'flex' : 'none';
+    lightboxMediaSlot.innerHTML = '';
 
     if (kind === 'image') {{
       const img = document.createElement('img');
       img.src = href;
       img.alt = name;
-      lightboxBody.appendChild(img);
+      lightboxMediaSlot.appendChild(img);
     }} else if (kind === 'video') {{
       const vid = document.createElement('video');
       vid.src = href;
       vid.controls = true;
       vid.autoplay = true;
-      lightboxBody.appendChild(vid);
+      lightboxMediaSlot.appendChild(vid);
     }} else if (kind === 'audio') {{
       const aud = document.createElement('audio');
       aud.src = href;
       aud.controls = true;
       aud.autoplay = true;
-      lightboxBody.appendChild(aud);
+      lightboxMediaSlot.appendChild(aud);
     }}
   }}
 
+  async function toggleLightboxFullscreen() {{
+    if (document.fullscreenElement) {{
+      try {{ await document.exitFullscreen(); }} catch {{}}
+      lightboxModal.classList.remove('is-fullscreen');
+      return;
+    }}
+    if (lightboxModal.requestFullscreen) {{
+      try {{
+        await lightboxModal.requestFullscreen();
+        return;
+      }} catch {{}}
+    }}
+    lightboxModal.classList.toggle('is-fullscreen');
+  }}
+
   function closeLightbox() {{
-    lightboxBody.innerHTML = '';
+    if (document.fullscreenElement) {{
+      try {{ document.exitFullscreen(); }} catch {{}}
+    }}
+    lightboxModal.classList.remove('is-fullscreen');
+    lightboxMediaSlot.innerHTML = '';
     lightboxBackdrop.classList.remove('open');
     lightboxIndex = -1;
   }}
 
-  lightboxPrevBtn.addEventListener('click', () => {{
-    if (!lightboxItems.length) return;
-    lightboxIndex = (lightboxIndex - 1 + lightboxItems.length) % lightboxItems.length;
+  function stepLightbox(delta) {{
+    if (lightboxItems.length <= 1) return;
+    lightboxIndex = (lightboxIndex + delta + lightboxItems.length) % lightboxItems.length;
     renderLightboxItem();
-  }});
+  }}
 
-  lightboxNextBtn.addEventListener('click', () => {{
-    if (!lightboxItems.length) return;
-    lightboxIndex = (lightboxIndex + 1) % lightboxItems.length;
-    renderLightboxItem();
+  lightboxPrevBtn.addEventListener('click', () => stepLightbox(-1));
+  lightboxNextBtn.addEventListener('click', () => stepLightbox(1));
+  edgeTapLeft.addEventListener('click', (e) => {{
+    e.stopPropagation();
+    stepLightbox(-1);
   }});
-
+  edgeTapRight.addEventListener('click', (e) => {{
+    e.stopPropagation();
+    stepLightbox(1);
+  }});
+  lightboxFullscreenBtn.addEventListener('click', toggleLightboxFullscreen);
   lightboxCloseBtn.addEventListener('click', closeLightbox);
   lightboxBackdrop.addEventListener('click', (e) => {{
     if (e.target === lightboxBackdrop) closeLightbox();
@@ -2186,8 +2369,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     }}
     if (lightboxBackdrop.classList.contains('open')) {{
       if (e.key === 'Escape') closeLightbox();
-      else if (e.key === 'ArrowLeft') lightboxPrevBtn.click();
-      else if (e.key === 'ArrowRight') lightboxNextBtn.click();
+      else if (e.key === 'ArrowLeft') stepLightbox(-1);
+      else if (e.key === 'ArrowRight') stepLightbox(1);
+      else if (e.key.toLowerCase() === 'f') toggleLightboxFullscreen();
       return;
     }}
     if (modalBackdrop.classList.contains('open')) return;
@@ -2298,3 +2482,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+Hide comments
