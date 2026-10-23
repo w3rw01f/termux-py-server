@@ -7,8 +7,8 @@ Features:
   - Persistent cross-folder clipboard bar (Copy/Cut items, navigate via breadcrumbs, Paste Here)
   - Top monochrome upload progress bar + drag-and-drop uploads + streamed multipart disk writes
   - Bottom storage usage bar showing free space / total space and color-coded fill meter
-  - Inline Text Viewer & Editor modal (with Tab support, Ctrl+S, and auto-open on New Text File)
-  - Image & Media Lightbox modal with Prev/Next navigation and HTTP Range (206 Partial Content) streaming
+  - Inline Text Viewer & Editor modal (with Open in browser button, live cursor Ln/Col indicator, Tab support, Ctrl+S, and auto-open on New Text File)
+  - Image & Media Lightbox modal with Prev / Open / Next buttons, Download icon, Fullscreen mode, and Left/Right edge tap zones
   - Optional HTTP Basic Authentication (-a / --auth user:pass)
 
 Usage in Termux:
