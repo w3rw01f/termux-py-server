@@ -770,6 +770,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   .fill-ok {{ background: var(--accent); }}
   .fill-warn {{ background: var(--pkg); }}
   .fill-high {{ background: var(--danger); }}
+  .fill-neutral {{ background: var(--file); }}
   .table-wrap {{
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1013,7 +1014,12 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 <main>
   <div class="stats-bar">
     <span>{dir_count} folders, {file_count} files</span>
-    <span id="statusMsg"></span>
+    <div id="uploadBar" class="storage-info" style="display:none">
+      <div class="storage-meter">
+        <div id="uploadFill" class="storage-fill fill-neutral" style="width: 0%"></div>
+      </div>
+      <span id="uploadText">0 B / 0 B (0%)</span>
+    </div>
   </div>
   <div class="table-wrap">
     <table id="fileTable">
@@ -1138,12 +1144,54 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     setSelectMode(false);
   }});
 
+  const uploadBar = document.getElementById('uploadBar');
+  const uploadFill = document.getElementById('uploadFill');
+  const uploadText = document.getElementById('uploadText');
+
+  function formatBytes(b) {{
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (b >= 1024 && i < units.length - 1) {{ b /= 1024; i++; }}
+    return (i === 0 ? b.toFixed(0) : b.toFixed(1)) + ' ' + units[i];
+  }}
+
   menuUploadBtn.addEventListener('click', () => {{
     dropdownMenu.classList.remove('open');
     fileUpload.click();
   }});
+
   fileUpload.addEventListener('change', () => {{
-    if (fileUpload.files.length > 0) uploadForm.submit();
+    if (!fileUpload.files.length) return;
+    const formData = new FormData(uploadForm);
+    const xhr = new XMLHttpRequest();
+
+    uploadBar.style.display = 'inline-flex';
+    uploadFill.style.width = '0%';
+    uploadText.textContent = 'Uploading...';
+
+    xhr.upload.addEventListener('progress', (e) => {{
+      if (!e.lengthComputable) return;
+      const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
+      uploadFill.style.width = `${{pct}}%`;
+      uploadText.textContent = `${{formatBytes(e.loaded)}} / ${{formatBytes(e.total)}} (${{pct}}%)`;
+    }});
+
+    xhr.addEventListener('load', () => {{
+      if (xhr.status >= 200 && xhr.status < 400) {{
+        window.location.reload();
+      }} else {{
+        alert('Upload failed');
+        uploadBar.style.display = 'none';
+      }}
+    }});
+
+    xhr.addEventListener('error', () => {{
+      alert('Upload error');
+      uploadBar.style.display = 'none';
+    }});
+
+    xhr.open('POST', window.location.pathname);
+    xhr.send(formData);
   }});
 
   function syncDotfilesUI() {{
