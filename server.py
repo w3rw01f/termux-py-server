@@ -1,6 +1,3 @@
-termux_server.py
-
-
 #!/usr/bin/env python3
 """
 termux_server.py — Lightweight, zero-dependency HTTP file server for Termux.
@@ -153,6 +150,13 @@ def resolve_safe_path(rel_url_path: str) -> str:
     if os.path.commonpath([SERVER_ROOT, target]) != SERVER_ROOT:
         raise ValueError("Path escapes root directory")
     return target
+
+
+def validate_name(name: str, error: str) -> str:
+    """Validate an already-trimmed file or folder name."""
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError(error)
+    return name
 
 
 def unique_dest_path(dest_dir: str, basename: str) -> str:
@@ -430,8 +434,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 new_name = (data.get("new_name") or "").strip()
                 if not src_rel or not new_name:
                     raise ValueError("Source and new name are required")
-                if "/" in new_name or "\\" in new_name or new_name in (".", ".."):
-                    raise ValueError("Invalid file or folder name")
+                validate_name(new_name, "Invalid file or folder name")
                 src_path = resolve_safe_path(src_rel)
                 if src_path == SERVER_ROOT:
                     raise ValueError("Cannot rename server root")
@@ -482,9 +485,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
             elif action == "mkdir":
                 dir_rel = data.get("dir", "/")
-                folder_name = (data.get("name") or "").strip()
-                if not folder_name or "/" in folder_name or "\\" in folder_name or folder_name in (".", ".."):
-                    raise ValueError("Invalid folder name")
+                folder_name = validate_name((data.get("name") or "").strip(), "Invalid folder name")
                 parent_dir = resolve_safe_path(dir_rel)
                 new_dir = os.path.join(parent_dir, folder_name)
                 if os.path.exists(new_dir):
@@ -494,9 +495,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
             elif action == "touch":
                 dir_rel = data.get("dir", "/")
-                file_name = (data.get("name") or "").strip()
-                if not file_name or "/" in file_name or "\\" in file_name or file_name in (".", ".."):
-                    raise ValueError("Invalid file name")
+                file_name = validate_name((data.get("name") or "").strip(), "Invalid file name")
                 if "." not in file_name:
                     file_name += ".txt"
                 parent_dir = resolve_safe_path(dir_rel)
@@ -1023,7 +1022,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     margin: 12px auto 0;
     padding: 0 16px;
   }}
-  .stats-bar {{
+  .stats-bar, .footer-bar {{
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -1031,21 +1030,11 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     gap: 10px;
     color: var(--muted);
     font-size: 12px;
-    margin-bottom: 8px;
     padding: 0 4px;
   }}
+  .stats-bar {{ margin-bottom: 8px; }}
   /* Storage Footer Bar below File List */
-  .footer-bar {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 10px;
-    color: var(--muted);
-    font-size: 12px;
-    margin-top: 10px;
-    padding: 0 4px;
-  }}
+  .footer-bar {{ margin-top: 10px; }}
   .storage-info {{
     display: inline-flex;
     align-items: center;
@@ -1201,11 +1190,19 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   .modal-backdrop.open {{
     display: flex;
   }}
-  .modal {{
+  .modal, .editor-modal, .lightbox-modal {{
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 10px;
     width: 100%;
+  }}
+  .editor-modal, .lightbox-modal {{
+    max-width: 960px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }}
+  .modal {{
     max-width: 440px;
     padding: 18px;
     box-shadow: 0 16px 40px rgba(0, 0, 0, 0.75);
@@ -1258,16 +1255,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
   /* Inline Text Viewer & Editor Modal */
   .editor-modal {{
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    width: 100%;
-    max-width: 960px;
     height: min(86vh, 760px);
-    display: flex;
-    flex-direction: column;
     box-shadow: 0 18px 48px rgba(0, 0, 0, 0.8);
-    overflow: hidden;
   }}
   .editor-header, .editor-footer {{
     padding: 10px 14px;
@@ -1312,15 +1301,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
   /* Lightbox Modal for Images & Media */
   .lightbox-modal {{
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    width: 100%;
-    max-width: 960px;
     max-height: 90vh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
     box-shadow: 0 18px 48px rgba(0, 0, 0, 0.85);
   }}
   .lightbox-modal:fullscreen,
@@ -1599,78 +1580,77 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   const CLIPBOARD_KEY = 'termux_http_clipboard_v1';
   const DOTFILES_KEY = 'termux_http_dotfiles_v2';
 
-  const filterInput = document.getElementById('filterInput');
-  const hamburgerBtn = document.getElementById('hamburgerBtn');
-  const dropdownMenu = document.getElementById('dropdownMenu');
-  const menuSelectBtn = document.getElementById('menuSelectBtn');
-  const selectStateBadge = document.getElementById('selectStateBadge');
-  const menuUploadBtn = document.getElementById('menuUploadBtn');
-  const menuNewFolderBtn = document.getElementById('menuNewFolderBtn');
-  const menuNewTxtBtn = document.getElementById('menuNewTxtBtn');
-  const fileUpload = document.getElementById('fileUpload');
-  const uploadForm = document.getElementById('uploadForm');
-  const toggleDotBtn = document.getElementById('toggleDotBtn');
-  const dotStateBadge = document.getElementById('dotStateBadge');
+  const byId = id => document.getElementById(id);
+  const filterInput = byId('filterInput');
+  const hamburgerBtn = byId('hamburgerBtn');
+  const dropdownMenu = byId('dropdownMenu');
+  const menuSelectBtn = byId('menuSelectBtn');
+  const selectStateBadge = byId('selectStateBadge');
+  const menuUploadBtn = byId('menuUploadBtn');
+  const menuNewFolderBtn = byId('menuNewFolderBtn');
+  const menuNewTxtBtn = byId('menuNewTxtBtn');
+  const fileUpload = byId('fileUpload');
+  const toggleDotBtn = byId('toggleDotBtn');
+  const dotStateBadge = byId('dotStateBadge');
 
-  const uploadBar = document.getElementById('uploadBar');
-  const uploadFill = document.getElementById('uploadFill');
-  const uploadText = document.getElementById('uploadText');
+  const uploadBar = byId('uploadBar');
+  const uploadFill = byId('uploadFill');
+  const uploadText = byId('uploadText');
 
-  const tbody = document.getElementById('fileBody');
+  const tbody = byId('fileBody');
   const rows = Array.from(tbody.querySelectorAll('.item-row'));
   const headers = Array.from(document.querySelectorAll('th[data-sort]'));
-  const selectAllCheck = document.getElementById('selectAllCheck');
+  const selectAllCheck = byId('selectAllCheck');
 
-  const selectionBar = document.getElementById('selectionBar');
-  const selectedCountText = document.getElementById('selectedCountText');
-  const actCopyBtn = document.getElementById('actCopyBtn');
-  const actMoveBtn = document.getElementById('actMoveBtn');
-  const actRenameBtn = document.getElementById('actRenameBtn');
-  const actEditBtn = document.getElementById('actEditBtn');
-  const actZipBtn = document.getElementById('actZipBtn');
-  const actExtractBtn = document.getElementById('actExtractBtn');
-  const actDeleteBtn = document.getElementById('actDeleteBtn');
-  const actExitSelectBtn = document.getElementById('actExitSelectBtn');
+  const selectionBar = byId('selectionBar');
+  const selectedCountText = byId('selectedCountText');
+  const actCopyBtn = byId('actCopyBtn');
+  const actMoveBtn = byId('actMoveBtn');
+  const actRenameBtn = byId('actRenameBtn');
+  const actEditBtn = byId('actEditBtn');
+  const actZipBtn = byId('actZipBtn');
+  const actExtractBtn = byId('actExtractBtn');
+  const actDeleteBtn = byId('actDeleteBtn');
+  const actExitSelectBtn = byId('actExitSelectBtn');
 
-  const clipboardBar = document.getElementById('clipboardBar');
-  const clipboardText = document.getElementById('clipboardText');
-  const pasteHereBtn = document.getElementById('pasteHereBtn');
-  const clearClipboardBtn = document.getElementById('clearClipboardBtn');
+  const clipboardBar = byId('clipboardBar');
+  const clipboardText = byId('clipboardText');
+  const pasteHereBtn = byId('pasteHereBtn');
+  const clearClipboardBtn = byId('clearClipboardBtn');
 
-  const modalBackdrop = document.getElementById('modalBackdrop');
-  const modalTitle = document.getElementById('modalTitle');
-  const modalDesc = document.getElementById('modalDesc');
-  const modalInput = document.getElementById('modalInput');
-  const modalCheckRow = document.getElementById('modalCheckRow');
-  const modalExtraCheck = document.getElementById('modalExtraCheck');
-  const modalCheckLabel = document.getElementById('modalCheckLabel');
-  const modalCancelBtn = document.getElementById('modalCancelBtn');
-  const modalConfirmBtn = document.getElementById('modalConfirmBtn');
+  const modalBackdrop = byId('modalBackdrop');
+  const modalTitle = byId('modalTitle');
+  const modalDesc = byId('modalDesc');
+  const modalInput = byId('modalInput');
+  const modalCheckRow = byId('modalCheckRow');
+  const modalExtraCheck = byId('modalExtraCheck');
+  const modalCheckLabel = byId('modalCheckLabel');
+  const modalCancelBtn = byId('modalCancelBtn');
+  const modalConfirmBtn = byId('modalConfirmBtn');
 
-  const editorBackdrop = document.getElementById('editorBackdrop');
-  const editorTitle = document.getElementById('editorTitle');
-  const editorOpenLink = document.getElementById('editorOpenLink');
-  const editorRawLink = document.getElementById('editorRawLink');
-  const editorSaveBtn = document.getElementById('editorSaveBtn');
-  const editorCloseBtn = document.getElementById('editorCloseBtn');
-  const editorTextarea = document.getElementById('editorTextarea');
-  const editorCursorPos = document.getElementById('editorCursorPos');
-  const editorStats = document.getElementById('editorStats');
-  const editorStatus = document.getElementById('editorStatus');
+  const editorBackdrop = byId('editorBackdrop');
+  const editorTitle = byId('editorTitle');
+  const editorOpenLink = byId('editorOpenLink');
+  const editorRawLink = byId('editorRawLink');
+  const editorSaveBtn = byId('editorSaveBtn');
+  const editorCloseBtn = byId('editorCloseBtn');
+  const editorTextarea = byId('editorTextarea');
+  const editorCursorPos = byId('editorCursorPos');
+  const editorStats = byId('editorStats');
+  const editorStatus = byId('editorStatus');
 
-  const lightboxBackdrop = document.getElementById('lightboxBackdrop');
-  const lightboxModal = document.getElementById('lightboxModal');
-  const lightboxTitle = document.getElementById('lightboxTitle');
-  const lightboxBody = document.getElementById('lightboxBody');
-  const lightboxMediaSlot = document.getElementById('lightboxMediaSlot');
-  const edgeTapLeft = document.getElementById('edgeTapLeft');
-  const edgeTapRight = document.getElementById('edgeTapRight');
-  const lightboxPrevBtn = document.getElementById('lightboxPrevBtn');
-  const lightboxOpenLink = document.getElementById('lightboxOpenLink');
-  const lightboxNextBtn = document.getElementById('lightboxNextBtn');
-  const lightboxDownloadLink = document.getElementById('lightboxDownloadLink');
-  const lightboxFullscreenBtn = document.getElementById('lightboxFullscreenBtn');
-  const lightboxCloseBtn = document.getElementById('lightboxCloseBtn');
+  const lightboxBackdrop = byId('lightboxBackdrop');
+  const lightboxModal = byId('lightboxModal');
+  const lightboxTitle = byId('lightboxTitle');
+  const lightboxMediaSlot = byId('lightboxMediaSlot');
+  const edgeTapLeft = byId('edgeTapLeft');
+  const edgeTapRight = byId('edgeTapRight');
+  const lightboxPrevBtn = byId('lightboxPrevBtn');
+  const lightboxOpenLink = byId('lightboxOpenLink');
+  const lightboxNextBtn = byId('lightboxNextBtn');
+  const lightboxDownloadLink = byId('lightboxDownloadLink');
+  const lightboxFullscreenBtn = byId('lightboxFullscreenBtn');
+  const lightboxCloseBtn = byId('lightboxCloseBtn');
 
   // .dotfiles OFF by default
   let showDotfiles = localStorage.getItem(DOTFILES_KEY) === '1';
@@ -1922,19 +1902,15 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     clipboardBar.classList.add('visible');
   }}
 
-  actCopyBtn.addEventListener('click', () => {{
+  function queueSelected(mode) {{
     const paths = getSelectedRows().map(r => r.dataset.path);
     if (!paths.length) return;
-    setClipboard('copy', paths);
+    setClipboard(mode, paths);
     setSelectMode(false);
-  }});
+  }}
 
-  actMoveBtn.addEventListener('click', () => {{
-    const paths = getSelectedRows().map(r => r.dataset.path);
-    if (!paths.length) return;
-    setClipboard('move', paths);
-    setSelectMode(false);
-  }});
+  actCopyBtn.addEventListener('click', () => queueSelected('copy'));
+  actMoveBtn.addEventListener('click', () => queueSelected('move'));
 
   clearClipboardBtn.addEventListener('click', clearClipboard);
 
@@ -2146,24 +2122,17 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     edgeTapRight.style.display = hasMultiple ? 'flex' : 'none';
     lightboxMediaSlot.innerHTML = '';
 
+    const tag = {{ image: 'img', video: 'video', audio: 'audio' }}[kind];
+    if (!tag) return;
+    const media = document.createElement(tag);
+    media.src = href;
     if (kind === 'image') {{
-      const img = document.createElement('img');
-      img.src = href;
-      img.alt = name;
-      lightboxMediaSlot.appendChild(img);
-    }} else if (kind === 'video') {{
-      const vid = document.createElement('video');
-      vid.src = href;
-      vid.controls = true;
-      vid.autoplay = true;
-      lightboxMediaSlot.appendChild(vid);
-    }} else if (kind === 'audio') {{
-      const aud = document.createElement('audio');
-      aud.src = href;
-      aud.controls = true;
-      aud.autoplay = true;
-      lightboxMediaSlot.appendChild(aud);
+      media.alt = name;
+    }} else {{
+      media.controls = true;
+      media.autoplay = true;
     }}
+    lightboxMediaSlot.appendChild(media);
   }}
 
   async function toggleLightboxFullscreen() {{
@@ -2294,7 +2263,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       title: 'Rename Item',
       desc: `Enter a new name for "${{oldName}}":`,
       defaultValue: oldName,
-      showInput: true,
       confirmLabel: 'Rename',
       onConfirm: async (newName) => {{
         if (!newName || newName === oldName) return false;
@@ -2327,8 +2295,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     openModal({{
       title: 'New Folder',
       desc: `Create a folder inside ${{CURRENT_DIR}}:`,
-      defaultValue: '',
-      showInput: true,
       confirmLabel: 'Create',
       onConfirm: async (folderName) => {{
         if (!folderName) throw new Error('Folder name is required');
@@ -2344,10 +2310,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       title: 'New Text File',
       desc: `Enter file name (defaults to .txt if no extension is given):`,
       defaultValue: 'untitled.txt',
-      showInput: true,
       showCheckbox: true,
-      checkboxLabel: 'Open in editor after creation',
-      checkboxDefault: true,
       confirmLabel: 'Create',
       onConfirm: async (rawName, openAfter) => {{
         if (!rawName) throw new Error('File name is required');
@@ -2482,4 +2445,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-Hide comments
