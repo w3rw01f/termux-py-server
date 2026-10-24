@@ -27,25 +27,29 @@ and use a trusted network; Basic Authentication does not encrypt HTTP traffic.
   to open all details in a viewer-style modal. Results survive refreshes and folder
   navigation in the same tab. Use the colored **×** beside the message or **Clear**
   in the details window to dismiss the saved result. Clearing a result does not
-  cancel an active upload. Upload progress and cancellation remain available.
+  cancel an active upload. The **×** is hidden while uploading; use **Cancel upload**
+  to stop the transfer. Upload progress and cancellation remain available.
   Completion and error messages do not open blocking alerts; delete/discard
   confirmations still appear before those actions.
 - Cross-folder clipboard with individual success, failure, and skipped results.
   Failed or skipped clipboard items remain available to retry after a refresh.
-- Drag-and-drop or multi-file uploads with progress and cancellation. Existing
+- Drag-and-drop or multi-file uploads with progress and cancellation. File drops
+  are disabled while any viewer or dialog is open. Existing
   names prompt for **Keep both**, **Skip**, or **Replace**; keep-both is the default.
   The selected policy is checked again when files are published. Uploads that did
   not need a prompt also use keep-both if a collision appears later.
-- UTF-8 text viewer opens existing files in read mode. **Edit** reveals Save;
+- UTF-8 text viewer (including `.srt` subtitles) opens existing files in read mode. **Edit** reveals Save;
   Select → Edit and newly created files with “Open in editor” enabled enter edit
   mode directly. A non-selectable line-number gutter follows vertical scrolling,
   and long lines scroll horizontally without wrapping. Cursor and selection
   indicators, Tab indentation, Ctrl/Cmd+S, raw Open, and download remain available.
-- Image, audio, and video previews with Prev / Open / Next controls and an icon
+- Image, audio, video, and PDF previews with Prev / Open / Next controls and an icon
   download button. Media edges use narrow 11% tap zones; horizontal single-finger
   swipes navigate while pinch and vertical gestures are ignored. Fullscreen has
   synchronized expand/compress icons, the F shortcut, and a viewport fallback
-  when the browser restricts the native API.
+  when the browser restricts the native API. PDFs use the browser’s built-in viewer;
+  use Open or Download if inline viewing is unavailable. Edge taps and swipes are
+  disabled over PDFs so page and zoom controls remain accessible.
 - Storage usage meter and an on-demand **Size** button in each directory row.
   Click again to recalculate. Sizes include hidden files and sum logical file
   lengths recursively, rather than allocated disk space. Links are skipped;

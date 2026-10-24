@@ -59,7 +59,7 @@ class RequestError(ValueError):
 
 
 TEXT_EXTENSIONS = {
-    ".txt", ".md", ".log", ".rst", ".csv", ".tsv", ".py", ".sh", ".bash", ".zsh",
+    ".txt", ".md", ".log", ".rst", ".srt", ".csv", ".tsv", ".py", ".sh", ".bash", ".zsh",
     ".js", ".mjs", ".ts", ".tsx", ".jsx", ".json", ".html", ".htm", ".css", ".scss",
     ".c", ".h", ".cpp", ".hpp", ".rs", ".go", ".java", ".kt", ".kts", ".xml",
     ".yaml", ".yml", ".toml", ".ini", ".conf", ".cfg", ".sql", ".lua", ".rb",
@@ -94,7 +94,7 @@ FILE_CATEGORIES = {
     },
     "doc": {
         "exts": {
-            ".pdf", ".md", ".txt", ".log", ".rst", ".csv", ".tsv",
+            ".pdf", ".md", ".txt", ".log", ".rst", ".srt", ".csv", ".tsv",
             ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".epub", ".mobi",
         },
         "badge": "DOC",
@@ -706,7 +706,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
             badge, css_class = classify_file(name, is_dir, is_link)
             editable = int(not is_link and is_text_editable(name, is_dir))
             preview_kind = ""
-            if css_class == "ft-img":
+            if not is_dir and not is_link and name.lower().endswith(".pdf"):
+                preview_kind = "pdf"
+            elif css_class == "ft-img":
                 preview_kind = "image"
             elif css_class == "ft-media":
                 ext = os.path.splitext(name.lower())[1]
@@ -1482,6 +1484,18 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     width: min(480px, 90%);
     z-index: 1;
   }}
+  .lightbox-body.pdf-view {{ padding: 0; min-height: 0; user-select: text; touch-action: auto; }}
+  .pdf-view #lightboxMediaSlot {{
+    width: 100%;
+    height: min(70vh, 760px);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }}
+  .lightbox-modal:fullscreen .pdf-view #lightboxMediaSlot,
+  .lightbox-modal.is-fullscreen .pdf-view #lightboxMediaSlot {{ height: 100%; }}
+  .pdf-preview {{ width: 100%; flex: 1; min-height: 0; border: 0; background: white; }}
+  .pdf-help {{ padding: 6px 12px; font-size: 12px; color: var(--muted); flex-shrink: 0; }}
   /* Narrow edge taps leave the center and bottom media controls accessible. */
   .edge-tap-zone {{
     position: absolute;
@@ -1970,18 +1984,36 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     fileUpload.value = '';
   }});
 
-  // Drag & Drop upload anywhere on window
+  // Accept file drops only on the file list, never through an open viewer/dialog.
   let dragCounter = 0;
+  function anyWindowOpen() {{
+    return [editorBackdrop, lightboxBackdrop, modalBackdrop, operationBackdrop]
+      .some(backdrop => backdrop.classList.contains('open'));
+  }}
+
+  function resetDragState() {{
+    dragCounter = 0;
+    document.body.classList.remove('drag-over');
+  }}
+
+  function isFileDrag(e) {{
+    const transfer = e.dataTransfer;
+    return transfer && (Array.from(transfer.types || []).includes('Files') || (transfer.files && transfer.files.length));
+  }}
+
   window.addEventListener('dragenter', (e) => {{
-    if (e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files')) {{
-      e.preventDefault();
-      dragCounter++;
-      document.body.classList.add('drag-over');
-    }}
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    if (anyWindowOpen()) {{ resetDragState(); return; }}
+    dragCounter++;
+    document.body.classList.add('drag-over');
   }});
   window.addEventListener('dragover', (e) => {{
-    if (e.dataTransfer && Array.from(e.dataTransfer.types).includes('Files')) {{
-      e.preventDefault();
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    if (anyWindowOpen()) {{
+      e.dataTransfer.dropEffect = 'none';
+      resetDragState();
     }}
   }});
   window.addEventListener('dragleave', () => {{
@@ -1989,12 +2021,11 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     if (dragCounter === 0) document.body.classList.remove('drag-over');
   }});
   window.addEventListener('drop', (e) => {{
-    dragCounter = 0;
-    document.body.classList.remove('drag-over');
-    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {{
-      e.preventDefault();
-      uploadFileList(e.dataTransfer.files);
-    }}
+    resetDragState();
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    if (anyWindowOpen()) return;
+    if (e.dataTransfer.files && e.dataTransfer.files.length) uploadFileList(e.dataTransfer.files);
   }});
 
   function syncDotfilesUI() {{
@@ -2161,7 +2192,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
   function renderOperationStatus() {{
     uploadBar.style.display = activeUpload || lastOperation ? 'inline-flex' : 'none';
-    statusClearBtn.style.display = lastOperation ? '' : 'none';
+    statusClearBtn.style.display = lastOperation && !activeUpload ? '' : 'none';
     operationClearBtn.disabled = !lastOperation;
     uploadMeter.style.display = activeUpload ? '' : 'none';
     cancelUploadBtn.style.display = activeUpload ? '' : 'none';
@@ -2210,6 +2241,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     if (!lastOperation && !activeUpload) return;
     statusReturnFocus = document.activeElement;
     renderOperationDetails();
+    resetDragState();
     operationBackdrop.classList.add('open');
     operationCloseBtn.focus();
   }}
@@ -2374,6 +2406,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       editorTextarea.setSelectionRange(0, 0);
       setEditorMode(startInEditMode);
       updateEditorStats();
+      resetDragState();
       editorBackdrop.classList.add('open');
       setTimeout(() => {{
         if (startInEditMode) editorTextarea.focus();
@@ -2475,6 +2508,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     resetSwipe();
     renderLightboxItem();
     syncFullscreenIcon();
+    resetDragState();
     lightboxBackdrop.classList.add('open');
   }}
 
@@ -2491,21 +2525,32 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     lightboxDownloadLink.href = href;
     lightboxPrevBtn.disabled = !hasMultiple;
     lightboxNextBtn.disabled = !hasMultiple;
-    edgeTapLeft.style.display = hasMultiple ? 'flex' : 'none';
-    edgeTapRight.style.display = hasMultiple ? 'flex' : 'none';
+    const showEdges = hasMultiple && kind !== 'pdf';
+    edgeTapLeft.style.display = showEdges ? 'flex' : 'none';
+    edgeTapRight.style.display = showEdges ? 'flex' : 'none';
+    lightboxBody.classList.toggle('pdf-view', kind === 'pdf');
     lightboxMediaSlot.innerHTML = '';
 
-    const tag = {{ image: 'img', video: 'video', audio: 'audio' }}[kind];
+    const tag = {{ image: 'img', video: 'video', audio: 'audio', pdf: 'iframe' }}[kind];
     if (!tag) return;
     const media = document.createElement(tag);
     media.src = href;
     if (kind === 'image') {{
       media.alt = name;
+    }} else if (kind === 'pdf') {{
+      media.title = name;
+      media.className = 'pdf-preview';
     }} else {{
       media.controls = true;
       media.autoplay = true;
     }}
     lightboxMediaSlot.appendChild(media);
+    if (kind === 'pdf') {{
+      const help = document.createElement('p');
+      help.className = 'pdf-help';
+      help.textContent = 'PDF not displaying? Use Open or Download above.';
+      lightboxMediaSlot.appendChild(help);
+    }}
   }}
 
   async function toggleLightboxFullscreen() {{
@@ -2532,6 +2577,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     syncFullscreenIcon();
     resetSwipe();
     lightboxMediaSlot.innerHTML = '';
+    lightboxBody.classList.remove('pdf-view');
     lightboxBackdrop.classList.remove('open');
     lightboxIndex = -1;
   }}
@@ -2569,6 +2615,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }}
 
   lightboxBody.addEventListener('touchstart', (e) => {{
+    if (lightboxBody.classList.contains('pdf-view')) {{ resetSwipe(); return; }}
     if (e.touches.length !== 1 || multiTouchActive) {{
       multiTouchActive = true;
       swipeStart = null;
@@ -2633,6 +2680,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     modalConfirmBtn.textContent = confirmLabel;
     modalConfirmBtn.className = danger ? 'btn btn-danger' : 'btn btn-primary';
     modalHandler = onConfirm;
+    resetDragState();
     modalBackdrop.classList.add('open');
     if (showInput) {{
       setTimeout(() => {{
