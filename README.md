@@ -25,7 +25,9 @@ and use a trusted network; Basic Authentication does not encrypt HTTP traffic.
 - Select mode with copy, move, rename, edit, and delete.
 - Short operation messages appear in the top-right progress area. Click a message
   to open all details in a viewer-style modal. Results survive refreshes and folder
-  navigation in the same tab. Upload progress and cancellation remain available.
+  navigation in the same tab. Use the colored **×** beside the message or **Clear**
+  in the details window to dismiss the saved result. Clearing a result does not
+  cancel an active upload. Upload progress and cancellation remain available.
   Completion and error messages do not open blocking alerts; delete/discard
   confirmations still appear before those actions.
 - Cross-folder clipboard with individual success, failure, and skipped results.

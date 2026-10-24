@@ -1109,6 +1109,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     text-decoration: underline dotted;
     text-underline-offset: 3px;
   }}
+  .status-clear {{ color: var(--dir); font-size: 18px; line-height: 1; padding: 0 3px; flex-shrink: 0; text-decoration: none; }}
   .operation-status .status-message {{
     max-width: 40ch;
     min-width: 0;
@@ -1605,6 +1606,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         <div id="uploadFill" class="storage-fill fill-neutral" style="width: 0%"></div>
       </div>
       <button type="button" id="uploadText" class="status-message" aria-haspopup="dialog" aria-controls="operationBackdrop" title="View operation details"></button>
+      <button type="button" id="statusClearBtn" class="status-message status-clear" aria-label="Clear status" title="Clear status" style="display:none">×</button>
       <button type="button" id="cancelUploadBtn" class="btn btn-danger" style="display:none">Cancel upload</button>
     </div>
   </div>
@@ -1638,7 +1640,10 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   <section class="editor-modal operation-modal" role="dialog" aria-modal="true" aria-labelledby="operationTitle">
     <div class="editor-header">
       <span id="operationTitle" class="editor-title">Operation details</span>
-      <button type="button" id="operationCloseBtn" class="btn">Close</button>
+      <div class="bar-actions">
+        <button type="button" id="operationClearBtn" class="btn">Clear</button>
+        <button type="button" id="operationCloseBtn" class="btn">Close</button>
+      </div>
     </div>
     <pre id="operationDetails" class="operation-details" tabindex="0"></pre>
   </section>
@@ -1764,6 +1769,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   const operationBackdrop = byId('operationBackdrop');
   const operationDetails = byId('operationDetails');
   const operationCloseBtn = byId('operationCloseBtn');
+  const operationClearBtn = byId('operationClearBtn');
+  const statusClearBtn = byId('statusClearBtn');
   const modalStatus = byId('modalStatus');
 
   const tbody = byId('fileBody');
@@ -2154,6 +2161,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
   function renderOperationStatus() {{
     uploadBar.style.display = activeUpload || lastOperation ? 'inline-flex' : 'none';
+    statusClearBtn.style.display = lastOperation ? '' : 'none';
+    operationClearBtn.disabled = !lastOperation;
     uploadMeter.style.display = activeUpload ? '' : 'none';
     cancelUploadBtn.style.display = activeUpload ? '' : 'none';
     uploadText.textContent = activeUpload ? uploadProgressText : lastOperation ? lastOperation.summary : '';
@@ -2190,7 +2199,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }}
 
   function reloadAfterOperation() {{
-    if (statusPersisted) {{ window.location.reload(); return; }}
+    if (statusPersisted || !lastOperation) {{ window.location.reload(); return; }}
     if (lastOperation) {{
       lastOperation.details += '\\n\\nRefresh the page to update the file list after reviewing these details.';
       renderOperationStatus();
@@ -2209,6 +2218,28 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     operationBackdrop.classList.remove('open');
     if (statusReturnFocus && statusReturnFocus.isConnected !== false) statusReturnFocus.focus();
   }}
+
+  function clearOperationStatus() {{
+    lastOperation = null;
+    statusPersisted = false;
+    try {{ sessionStorage.removeItem(OPERATION_STATUS_KEY); }} catch {{}}
+    modalStatus.style.display = 'none';
+    if (!activeUpload && operationBackdrop.classList.contains('open')) closeOperationDetails();
+    renderOperationDetails();
+    renderOperationStatus();
+    // Clearing a result must not cancel an upload or leave focus on a hidden control.
+    if (document.activeElement === statusClearBtn || document.activeElement === uploadText ||
+        document.activeElement === modalStatus || document.activeElement === operationClearBtn) {{
+      if (operationBackdrop.classList.contains('open')) operationCloseBtn.focus();
+      else if (activeUpload) uploadText.focus();
+      else if (editorBackdrop.classList.contains('open')) editorTextarea.focus();
+      else if (modalBackdrop.classList.contains('open')) modalConfirmBtn.focus();
+      else filterInput.focus();
+    }}
+  }}
+
+  statusClearBtn.addEventListener('click', clearOperationStatus);
+  operationClearBtn.addEventListener('click', clearOperationStatus);
 
   uploadText.addEventListener('click', openOperationDetails);
   editorStatus.addEventListener('click', openOperationDetails);
@@ -2733,7 +2764,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       if (e.key === 'Escape') {{ e.preventDefault(); closeOperationDetails(); }}
       else if (e.key === 'Tab') {{
         e.preventDefault();
-        (document.activeElement === operationCloseBtn ? operationDetails : operationCloseBtn).focus();
+        const controls = operationClearBtn.disabled ? [operationCloseBtn, operationDetails] : [operationClearBtn, operationCloseBtn, operationDetails];
+        const next = controls.indexOf(document.activeElement) + (e.shiftKey ? -1 : 1);
+        controls[(next + controls.length) % controls.length].focus();
       }}
       return;
     }}
