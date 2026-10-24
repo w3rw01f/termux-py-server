@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-termux_server.py — Lightweight, zero-dependency HTTP file server for Termux.
+server.py — Lightweight, zero-dependency HTTP file server for Termux.
 Features:
   - Termux-inspired dark minimalist UI with monospace typography
   - Sticky breadcrumb navigation bar at the top
@@ -9,18 +9,20 @@ Features:
   - Persistent cross-folder clipboard bar (Copy/Cut items, navigate via breadcrumbs, Paste Here)
   - Top monochrome upload progress bar + drag-and-drop uploads + streamed multipart disk writes
   - Bottom storage usage bar showing free space / total space and color-coded fill meter
-  - Inline Text Viewer & Editor modal (with Open in browser button, live cursor Ln/Col indicator, Tab support, Ctrl+S, and auto-open on New Text File)
-  - Image & Media Lightbox modal with Prev / Open / Next buttons, Download icon, Fullscreen mode, and Left/Right edge tap zones
+  - Read-first text viewer with synchronized line-number gutter, direct Edit mode, Open/download, cursor/selection indicators, Tab, and Ctrl+S
+  - Media viewer with Prev / Open / Next, download, dynamic fullscreen icons, 11% edge taps, and pinch-aware swipe navigation
   - Optional HTTP Basic Authentication (-a / --auth user:pass)
 
 Usage in Termux:
-  python termux_server.py [port] [-d DIRECTORY] [-a USER:PASS]
+  python server.py [port] [-d DIRECTORY] [-b BIND] [-a USER:PASS]
 """
 
 import argparse
 import base64
 import datetime
 import hmac
+import hashlib
+import errno
 import html
 import io
 import json
@@ -30,15 +32,34 @@ import re
 import shutil
 import socket
 import sys
+import stat
+import threading
 import tarfile
 import tempfile
 import urllib.parse
 import zipfile
+from email.parser import BytesHeaderParser, HeaderParser
+from contextlib import nullcontext
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-SERVER_ROOT = os.getcwd()
+SERVER_ROOT = os.path.realpath(os.getcwd())
 SERVER_AUTH_TOKEN = None  # Base64 "user:pass" when --auth is enabled
+
+# Serialize mutations from this server; external filesystem writers remain independent.
+FILE_LOCK = threading.RLock()
+TEMP_PREFIX = ".termux-tmp-"
+MAX_TEXT_BYTES = 2 * 1024 * 1024
+MAX_JSON_BYTES = 16 * 1024 * 1024
+MAX_EXTRACT_BYTES = 1024 * 1024 * 1024
+MAX_EXTRACT_FILES = 10000
+
+
+class RequestError(ValueError):
+    def __init__(self, message, status=HTTPStatus.BAD_REQUEST):
+        super().__init__(message)
+        self.status = status
+
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".log", ".rst", ".csv", ".tsv", ".py", ".sh", ".bash", ".zsh",
@@ -98,10 +119,10 @@ FILE_CATEGORIES = {
 
 
 def classify_file(name: str, is_dir: bool, is_link: bool):
-    if is_dir:
-        return ("DIR", "ft-dir")
     if is_link:
         return ("LINK", "ft-link")
+    if is_dir:
+        return ("DIR", "ft-dir")
     _, ext = os.path.splitext(name.lower())
     for cat in FILE_CATEGORIES.values():
         if ext in cat["exts"]:
@@ -142,19 +163,30 @@ def human_size(num_bytes: int) -> str:
     return f"{num_bytes:.1f} TB"
 
 
-def resolve_safe_path(rel_url_path: str) -> str:
-    """Resolve a URL-style relative path safely inside SERVER_ROOT."""
-    cleaned = urllib.parse.unquote(rel_url_path or "/").lstrip("/")
-    norm_rel = os.path.normpath(cleaned) if cleaned else "."
-    target = os.path.abspath(os.path.join(SERVER_ROOT, norm_rel))
-    if os.path.commonpath([SERVER_ROOT, target]) != SERVER_ROOT:
+def resolve_safe_path(rel_url_path: str, allow_leaf_link=False) -> str:
+    """Reject traversal and symlinks; leaf links may only be manipulated as links."""
+    if not isinstance(rel_url_path, str) or "\0" in rel_url_path:
+        raise ValueError("Invalid path")
+    root = os.path.realpath(SERVER_ROOT)
+    # API paths are decoded strings. HTTP paths are decoded once in translate_path.
+    target = os.path.abspath(os.path.join(root, rel_url_path.lstrip("/")))
+    if os.path.commonpath([root, target]) != root:
         raise ValueError("Path escapes root directory")
+    current = root
+    parts = os.path.relpath(target, root).split(os.sep)
+    for index, part in enumerate(parts):
+        if part.startswith(TEMP_PREFIX):
+            raise ValueError("Temporary files are private")
+        current = os.path.join(current, part)
+        if os.path.islink(current) and not (allow_leaf_link and index == len(parts) - 1):
+            raise ValueError("Opening or traversing symbolic links is disabled")
     return target
 
 
 def validate_name(name: str, error: str) -> str:
     """Validate an already-trimmed file or folder name."""
-    if not name or "/" in name or "\\" in name or name in (".", ".."):
+    if (not name or "/" in name or "\\" in name or name in (".", "..")
+            or name.startswith(TEMP_PREFIX) or any(ord(c) < 32 or ord(c) == 127 for c in name)):
         raise ValueError(error)
     return name
 
@@ -174,28 +206,190 @@ def unique_dest_path(dest_dir: str, basename: str) -> str:
         counter += 1
 
 
+def copy_limited(source, destination, limit):
+    total = 0
+    while True:
+        chunk = source.read(min(65536, limit - total + 1))
+        if not chunk:
+            return total
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("Extracted data exceeds the size limit")
+        destination.write(chunk)
+
+
 def safe_extract_archive(archive_path: str, extract_dir: str):
-    """Safely extract zip or tar archives while preventing path traversal."""
-    lower = archive_path.lower()
-    abs_dest = os.path.abspath(extract_dir)
-    if lower.endswith(".zip"):
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            for member in zf.infolist():
-                target = os.path.abspath(os.path.join(abs_dest, member.filename))
-                if os.path.commonpath([abs_dest, target]) != abs_dest:
-                    raise ValueError(f"Unsafe path in zip archive: {member.filename}")
-            zf.extractall(abs_dest)
+    """Extract regular files/directories only, with path, count and size limits."""
+    total = 0
+    count = 0
+    root = os.path.realpath(extract_dir)
+
+    def destination(name, size):
+        nonlocal count
+        count += 1
+        if count > MAX_EXTRACT_FILES:
+            raise ValueError("Archive has too many entries")
+        normalized = name.replace("\\", "/")
+        if normalized.startswith("/") or ".." in normalized.split("/"):
+            raise ValueError("Unsafe archive path")
+        target = os.path.realpath(os.path.join(root, normalized))
+        if os.path.commonpath([root, target]) != root:
+            raise ValueError("Archive path escapes extraction directory")
+        if any(part.startswith(TEMP_PREFIX) for part in normalized.split("/")):
+            raise ValueError("Reserved archive path")
+        if size < 0 or total + size > MAX_EXTRACT_BYTES:
+            raise ValueError("Archive exceeds extracted size limit")
+        return target
+
+    def extract_file(target, source):
+        nonlocal total
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with source, open(target, "xb") as output:
+            total += copy_limited(source, output, MAX_EXTRACT_BYTES - total)
+
+    if archive_path.lower().endswith(".zip"):
+        with zipfile.ZipFile(archive_path) as archive:
+            for member in archive.infolist():
+                kind = stat.S_IFMT(member.external_attr >> 16)
+                if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                    raise ValueError("Archive links and special files are disabled")
+                target = destination(member.filename, member.file_size)
+                if member.is_dir():
+                    os.makedirs(target, exist_ok=True)
+                else:
+                    extract_file(target, archive.open(member))
     else:
-        with tarfile.open(archive_path, "r:*") as tf:
-            for member in tf.getmembers():
-                target = os.path.abspath(os.path.join(abs_dest, member.name))
-                if os.path.commonpath([abs_dest, target]) != abs_dest:
-                    raise ValueError(f"Unsafe path in tar archive: {member.name}")
-            tf.extractall(abs_dest)
+        directory_metadata = []
+        with tarfile.open(archive_path, "r:*") as archive:
+            for member in archive:
+                if not (member.isfile() or member.isdir()):
+                    raise ValueError("Archive links and special files are disabled")
+                target = destination(member.name, member.size)
+                if hasattr(tarfile, "data_filter"):
+                    member = tarfile.data_filter(member, root)
+                if member.isdir():
+                    os.makedirs(target, exist_ok=True)
+                    directory_metadata.append((target, member))
+                else:
+                    extract_file(target, archive.extractfile(member))
+                    # Preserve executable scripts and timestamps without special bits/ownership.
+                    os.chmod(target, ((member.mode or 0o600) & 0o777) | 0o600)
+                    os.utime(target, (member.mtime, member.mtime))
+        for target, member in reversed(directory_metadata):
+            os.utime(target, (member.mtime, member.mtime))
+
+
+def read_text_version(target):
+    with open(target, "rb") as source:
+        raw = source.read(MAX_TEXT_BYTES + 1)
+        metadata = os.fstat(source.fileno())
+    if len(raw) > MAX_TEXT_BYTES:
+        raise ValueError("File is larger than 2 MB; download to edit locally")
+    if b"\0" in raw:
+        raise ValueError("Binary files cannot be edited; download instead")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("File is not valid UTF-8; download to edit without data loss") from None
+    stamp = f"{metadata.st_mtime_ns}:{metadata.st_size}:{metadata.st_ino}".encode()
+    version = hashlib.sha256(stamp + raw).hexdigest()
+    return text, version, metadata
+
+
+def save_text(target, content, version):
+    if not isinstance(content, str) or "\0" in content or len(content.encode("utf-8")) > MAX_TEXT_BYTES:
+        raise ValueError("Text must be a string of at most 2 MB")
+    with FILE_LOCK:
+        original, current_version, metadata = read_text_version(target)
+        if version != current_version:
+            raise RequestError("File changed since it was opened. Reopen it before saving; your edits are still in the editor.", HTTPStatus.CONFLICT)
+        # Textareas normalize line endings. Preserve uniform CRLF/CR files on save.
+        if "\r\n" in original and "\n" not in original.replace("\r\n", ""):
+            content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+        elif "\r" in original and "\n" not in original:
+            content = content.replace("\r\n", "\n").replace("\n", "\r")
+        payload = content.encode("utf-8")
+        if len(payload) > MAX_TEXT_BYTES:
+            raise ValueError("Text exceeds 2 MB after preserving line endings")
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=os.path.dirname(target), prefix=TEMP_PREFIX, delete=False) as temp:
+                temp_path = temp.name
+                temp.write(payload)
+                temp.flush()
+                os.fsync(temp.fileno())
+                os.chmod(temp.name, stat.S_IMODE(metadata.st_mode))
+            # Detect edits made outside this server while writing the temporary file.
+            if read_text_version(target)[1] != current_version:
+                raise RequestError("File changed while saving; reopen it before saving again", HTTPStatus.CONFLICT)
+            os.replace(temp_path, target)
+            return read_text_version(target)[1]
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+
+class MultipartReader:
+    """Bounded streaming parser that retains boundaries split across reads."""
+    def __init__(self, stream, length, boundary):
+        self.stream, self.remaining = stream, length
+        self.buffer = b""
+        self.boundary = boundary
+
+    def fill(self):
+        if not self.remaining:
+            raise ValueError("Upload ended before its closing boundary")
+        chunk = self.stream.read(min(65536, self.remaining))
+        if not chunk:
+            raise ValueError("Upload was interrupted; incomplete files were discarded")
+        self.remaining -= len(chunk)
+        self.buffer += chunk
+
+    def take_until(self, marker, limit):
+        while marker not in self.buffer:
+            if len(self.buffer) > limit:
+                raise ValueError("Multipart headers are too large")
+            self.fill()
+        head, self.buffer = self.buffer.split(marker, 1)
+        if len(head) > limit:
+            raise ValueError("Multipart headers are too large")
+        return head
+
+    def body(self, output):
+        marker = b"\r\n--" + self.boundary
+        while True:
+            index = self.buffer.find(marker)
+            if index >= 0:
+                while len(self.buffer) < index + len(marker) + 2:
+                    self.fill()
+                suffix = self.buffer[index + len(marker):index + len(marker) + 2]
+                if suffix == b"--":
+                    end = index + len(marker) + 2
+                    while len(self.buffer) < end + 2 and self.remaining:
+                        self.fill()
+                    if self.buffer[end:end + 2] not in (b"", b"\r\n"):
+                        suffix = b"invalid"
+                if suffix in (b"--", b"\r\n"):
+                    output.write(self.buffer[:index])
+                    self.buffer = self.buffer[index + len(marker) + 2:]
+                    return suffix == b"--"
+                # A boundary-like string in binary data is ordinary payload.
+                output.write(self.buffer[:index + 2])
+                self.buffer = self.buffer[index + 2:]
+            else:
+                keep = len(marker) + 2
+                if len(self.buffer) > keep:
+                    output.write(self.buffer[:-keep])
+                    self.buffer = self.buffer[-keep:]
+                self.fill()
 
 
 class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
-    server_version = "TermuxHTTP/3.1"
+    server_version = "TermuxHTTP/3.3"
+
+    def setup(self):
+        self.request.settimeout(30)
+        super().setup()
 
     def end_headers(self):
         self.send_header("Accept-Ranges", "bytes")
@@ -226,28 +420,48 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def translate_path(self, path):
+        decoded = urllib.parse.unquote(urllib.parse.urlsplit(path).path)
+        return resolve_safe_path(decoded)
+
+    def send_head(self):
+        try:
+            path = self.translate_path(self.path)
+            if os.path.isdir(path):
+                for index in ("index.html", "index.htm"):
+                    if os.path.lexists(os.path.join(path, index)):
+                        resolve_safe_path(os.path.relpath(os.path.join(path, index), SERVER_ROOT))
+            if os.path.exists(path) and not (os.path.isdir(path) or os.path.isfile(path)):
+                raise ValueError("Only regular files and directories can be opened")
+            return super().send_head()
+        except (ValueError, OSError) as exc:
+            self.send_error(HTTPStatus.FORBIDDEN, str(exc))
+            return None
+
     def do_HEAD(self):
-        if not self.check_auth():
-            return
-        super().do_HEAD()
+        if self.check_auth():
+            super().do_HEAD()
 
     def do_GET(self):
         if not self.check_auth():
             return
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.query:
-            qs = urllib.parse.parse_qs(parsed.query)
-            if qs.get("action") == ["zip"]:
-                items = qs.get("item", [])
-                self.handle_zip_download(items)
-                return
-
-        range_header = self.headers.get("Range")
-        if range_header:
+        qs = urllib.parse.parse_qs(parsed.query)
+        if qs.get("action") == ["zip"]:
+            self.handle_zip_download(qs.get("item", []))
+            return
+        try:
             path = self.translate_path(self.path)
-            if os.path.isfile(path):
-                self.send_range_response(path, range_header)
-                return
+            range_header = self.headers.get("Range")
+            # Multiple/unknown range units are deliberately ignored (full 200).
+            if range_header and "," not in range_header and range_header.startswith("bytes=") and os.path.isfile(path):
+                if_range = self.headers.get("If-Range")
+                if not if_range or if_range == self.date_time_string(os.path.getmtime(path)):
+                    self.send_range_response(path, range_header)
+                    return
+        except (ValueError, OSError) as exc:
+            self.send_error(HTTPStatus.FORBIDDEN, str(exc))
+            return
         super().do_GET()
 
     def do_POST(self):
@@ -290,12 +504,14 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                         if os.path.isdir(full_path) and not os.path.islink(full_path):
                             parent_dir = os.path.dirname(full_path.rstrip("/\\"))
                             for root, dirs, files in os.walk(full_path):
+                                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d)) and not d.startswith(TEMP_PREFIX)]
                                 rel_root = os.path.relpath(root, parent_dir)
                                 if not files and not dirs:
                                     zf.writestr(rel_root.rstrip("/") + "/", "")
                                 for fname in files:
                                     fpath = os.path.join(root, fname)
-                                    if os.path.isfile(fpath):
+                                    if os.path.isfile(fpath) and not os.path.islink(fpath) and not fname.startswith(TEMP_PREFIX):
+                                        resolve_safe_path(os.path.relpath(fpath, SERVER_ROOT))
                                         arcname = os.path.join(rel_root, fname)
                                         zf.write(fpath, arcname)
                         elif os.path.isfile(full_path):
@@ -308,7 +524,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 safe_zip_name = urllib.parse.quote(zip_name)
                 self.send_header(
                     "Content-Disposition",
-                    f"attachment; filename=\"{zip_name}\"; filename*=UTF-8''{safe_zip_name}",
+                    f"attachment; filename=\"download.zip\"; filename*=UTF-8''{safe_zip_name}",
                 )
                 self.send_header("Content-Length", str(size))
                 self.end_headers()
@@ -319,261 +535,293 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
             self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
 
     def handle_file_upload(self, content_type: str):
-        """Stream multipart/form-data file uploads directly to disk without RAM spikes."""
-        path = self.translate_path(self.path)
-        if not os.path.isdir(path):
-            self.send_error(HTTPStatus.BAD_REQUEST, "Target path is not a directory")
-            return
-
-        boundary_match = re.search(r"boundary=([^;\s]+)", content_type)
-        if not boundary_match:
-            self.send_error(HTTPStatus.BAD_REQUEST, "Missing multipart boundary")
-            return
-
-        boundary_bytes = boundary_match.group(1).strip('"').encode("utf-8")
-        delim = b"--" + boundary_bytes
-        remaining = int(self.headers.get("Content-Length", 0))
-
-        def read_line() -> bytes:
-            nonlocal remaining
-            if remaining <= 0:
-                return b""
-            line = self.rfile.readline(min(remaining, 65536))
-            remaining -= len(line)
-            return line
-
-        # Advance to first boundary
-        while remaining > 0:
-            line = read_line()
-            if not line:
-                break
-            if line.strip().startswith(delim):
-                break
-
-        while remaining > 0:
-            # Parse part headers
-            headers_raw = []
-            while remaining > 0:
-                line = read_line()
-                if not line or line in (b"\r\n", b"\n"):
+        """Stage the entire multipart request before publishing completed files."""
+        staged = []
+        try:
+            path = self.translate_path(self.path)
+            if not os.path.isdir(path):
+                raise ValueError("Target path is not a directory")
+            policy = self.headers.get("X-Upload-Conflict", "keep")
+            if policy not in ("keep", "skip", "replace"):
+                raise ValueError("Invalid upload collision policy")
+            message = BytesHeaderParser().parsebytes(("Content-Type: " + content_type + "\r\n\r\n").encode())
+            boundary = message.get_boundary()
+            if not boundary or len(boundary) > 200 or any(ord(c) < 32 or ord(c) > 126 for c in boundary):
+                raise ValueError("Invalid multipart boundary")
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                raise ValueError("Content-Length is required")
+            if length > shutil.disk_usage(path).free:
+                raise RequestError("Not enough free storage for this upload", HTTPStatus.INSUFFICIENT_STORAGE)
+            reader = MultipartReader(self.rfile, length, boundary.encode("ascii"))
+            if reader.take_until(b"\r\n", 204) != b"--" + boundary.encode("ascii"):
+                raise ValueError("Invalid initial multipart boundary")
+            while True:
+                if len(staged) >= MAX_EXTRACT_FILES:
+                    raise ValueError("Too many uploaded files")
+                headers = HeaderParser().parsestr(reader.take_until(b"\r\n\r\n", 65536).decode("utf-8") + "\r\n\r\n")
+                filename = headers.get_filename()
+                if not filename:
+                    raise ValueError("Every upload part must contain a filename")
+                validate_name(filename, "Invalid upload filename")
+                # Reject link destinations even for replacement; no content operation follows links.
+                resolve_safe_path(os.path.relpath(os.path.join(path, filename), SERVER_ROOT))
+                with tempfile.NamedTemporaryFile(dir=path, prefix=TEMP_PREFIX, delete=False) as output:
+                    staged.append((filename, output.name))
+                    final = reader.body(output)
+                    output.flush()
+                    os.fsync(output.fileno())
+                if final:
                     break
-                headers_raw.append(line.decode("utf-8", errors="replace"))
-
-            if not headers_raw:
-                break
-
-            header_block = "".join(headers_raw)
-            fn_match = re.search(r'filename="([^"]*)"', header_block)
-            filename = os.path.basename(fn_match.group(1)) if (fn_match and fn_match.group(1)) else None
-
-            out_file = None
-            if filename:
-                dest_path = os.path.join(path, filename)
-                out_file = open(dest_path, "wb")
-
-            # Stream part body until next boundary line, holding trailing \r\n in prev_tail
-            prev_tail = b""
+            # Consume/check the remainder so a truncated request never publishes files.
+            while reader.remaining:
+                reader.fill()
+                if len(reader.buffer) > 65536:
+                    raise ValueError("Unexpected data after upload boundary")
+            if reader.buffer not in (b"", b"\r\n"):
+                raise ValueError("Unexpected data after upload boundary")
+            results = []
+            with FILE_LOCK:
+                for filename, temp in staged:
+                    result = {"path": filename}
+                    try:
+                        target = resolve_safe_path(os.path.relpath(os.path.join(path, filename), SERVER_ROOT))
+                        if os.path.lexists(target):
+                            if policy == "skip":
+                                result.update(status="skipped", error="Already exists")
+                                results.append(result)
+                                continue
+                            if policy == "keep":
+                                target = unique_dest_path(path, filename)
+                            elif not os.path.isfile(target):
+                                raise ValueError("Cannot replace a directory or special file")
+                        os.replace(temp, target)
+                        result.update(status="success", name=os.path.basename(target))
+                    except (OSError, ValueError) as exc:
+                        result.update(status="failed", error=str(exc))
+                    results.append(result)
+            self.send_json(HTTPStatus.OK, {"ok": True, "results": results})
+        except (OSError, ValueError) as exc:
+            self.close_connection = True
+            status = HTTPStatus.INSUFFICIENT_STORAGE if isinstance(exc, OSError) and exc.errno == errno.ENOSPC else getattr(exc, "status", HTTPStatus.BAD_REQUEST)
             try:
-                while remaining > 0:
-                    line = read_line()
-                    if not line:
-                        break
-                    stripped = line.rstrip(b"\r\n")
-                    if stripped == delim or stripped == delim + b"--":
-                        # Trim the CRLF that preceded the boundary
-                        if prev_tail.endswith(b"\r\n"):
-                            prev_tail = prev_tail[:-2]
-                        elif prev_tail.endswith(b"\n"):
-                            prev_tail = prev_tail[:-1]
-                        if out_file and prev_tail:
-                            out_file.write(prev_tail)
-                        prev_tail = b""
-                        break
-                    if out_file and prev_tail:
-                        out_file.write(prev_tail)
-                    prev_tail = line
-            finally:
-                if out_file:
-                    out_file.close()
+                self.send_json(status, {"ok": False, "error": str(exc)})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        finally:
+            for _, temp in staged:
+                if os.path.exists(temp):
+                    os.unlink(temp)
 
-        self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", self.path)
-        self.end_headers()
+    def handle_batch(self, data):
+        action, items = data["action"], data.get("items")
+        if not isinstance(items, list) or not items or not all(isinstance(p, str) for p in items):
+            raise ValueError("Select one or more item paths")
+        results = []
+        with FILE_LOCK:
+            for rel in items:
+                result = {"path": rel}
+                try:
+                    source = resolve_safe_path(rel, allow_leaf_link=True)
+                    if source == os.path.realpath(SERVER_ROOT):
+                        raise ValueError("Cannot modify the server root directory")
+                    if not os.path.lexists(source):
+                        result.update(status="skipped", error="Item no longer exists")
+                    elif action == "delete":
+                        if os.path.islink(source) or not os.path.isdir(source):
+                            os.unlink(source)
+                        else:
+                            shutil.rmtree(source)
+                        result["status"] = "success"
+                    else:
+                        dest = resolve_safe_path(data.get("dest_dir", "/"))
+                        if not os.path.isdir(dest):
+                            raise ValueError("Destination directory does not exist")
+                        name = os.path.basename(source)
+                        target = os.path.join(dest, name)
+                        if not os.path.islink(source) and os.path.isdir(source) and os.path.commonpath([source, dest]) == source:
+                            raise ValueError("Cannot copy or move a folder into itself")
+                        if action == "copy":
+                            target = unique_dest_path(dest, name)
+                            if os.path.isdir(source) and not os.path.islink(source):
+                                shutil.copytree(source, target, symlinks=True)
+                            else:
+                                shutil.copy2(source, target, follow_symlinks=False)
+                        elif source == target:
+                            result.update(status="skipped", error="Already in the destination directory")
+                        elif os.path.lexists(target):
+                            raise ValueError("An item with this name already exists in the destination")
+                        else:
+                            shutil.move(source, target)
+                        result.setdefault("status", "success")
+                except (ValueError, OSError) as exc:
+                    result.update(status="failed", error=str(exc))
+                results.append(result)
+        succeeded = sum(r["status"] == "success" for r in results)
+        return {"ok": True, "results": results, "deleted" if action == "delete" else "processed": succeeded}
 
     def handle_api_action(self):
         """Handle JSON file operations: delete, rename, copy, move, mkdir, touch, read_text, write_text, extract."""
         try:
             content_length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(content_length).decode("utf-8")
-            data = json.loads(raw) if raw else {}
+            if not 0 < content_length <= MAX_JSON_BYTES:
+                raise ValueError("JSON request must be between 1 byte and 16 MB")
+            raw = self.rfile.read(content_length)
+            if len(raw) != content_length:
+                raise ValueError("Incomplete JSON request")
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("JSON request must be an object")
         except Exception as exc:
+            self.close_connection = True
             self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Invalid JSON: {exc}"})
             return
 
         action = data.get("action")
         try:
-            if action == "delete":
-                items = data.get("items", [])
-                if not items:
-                    raise ValueError("No items specified for deletion")
-                deleted = 0
-                for rel in items:
-                    target = resolve_safe_path(rel)
-                    if target == SERVER_ROOT:
-                        raise ValueError("Cannot delete server root directory")
-                    if os.path.islink(target) or os.path.isfile(target):
-                        os.unlink(target)
-                        deleted += 1
-                    elif os.path.isdir(target):
-                        shutil.rmtree(target)
-                        deleted += 1
-                self.send_json(HTTPStatus.OK, {"ok": True, "deleted": deleted})
+            with FILE_LOCK if action in ("delete", "copy", "move", "rename", "mkdir", "touch", "write_text", "extract") else nullcontext():
+                if action in ("delete", "copy", "move"):
+                    self.send_json(HTTPStatus.OK, self.handle_batch(data))
 
-            elif action == "rename":
-                src_rel = data.get("src", "")
-                new_name = (data.get("new_name") or "").strip()
-                if not src_rel or not new_name:
-                    raise ValueError("Source and new name are required")
-                validate_name(new_name, "Invalid file or folder name")
-                src_path = resolve_safe_path(src_rel)
-                if src_path == SERVER_ROOT:
-                    raise ValueError("Cannot rename server root")
-                dest_path = os.path.join(os.path.dirname(src_path), new_name)
-                if os.path.exists(dest_path) or os.path.islink(dest_path):
-                    raise ValueError(f"'{new_name}' already exists")
-                os.rename(src_path, dest_path)
-                self.send_json(HTTPStatus.OK, {"ok": True})
+                elif action == "rename":
+                    src_rel = data.get("src", "")
+                    new_name = (data.get("new_name") or "").strip()
+                    if not src_rel or not new_name:
+                        raise ValueError("Source and new name are required")
+                    validate_name(new_name, "Invalid file or folder name")
+                    src_path = resolve_safe_path(src_rel, allow_leaf_link=True)
+                    if src_path == os.path.realpath(SERVER_ROOT):
+                        raise ValueError("Cannot rename server root")
+                    dest_path = os.path.join(os.path.dirname(src_path), new_name)
+                    if os.path.exists(dest_path) or os.path.islink(dest_path):
+                        raise ValueError(f"'{new_name}' already exists")
+                    os.rename(src_path, dest_path)
+                    self.send_json(HTTPStatus.OK, {"ok": True})
 
-            elif action in ("copy", "move"):
-                items = data.get("items", [])
-                dest_rel = data.get("dest_dir", "/")
-                if not items:
-                    raise ValueError("No items selected")
-                dest_dir = resolve_safe_path(dest_rel)
-                if not os.path.isdir(dest_dir):
-                    raise ValueError("Destination directory does not exist")
+                elif action == "mkdir":
+                    dir_rel = data.get("dir", "/")
+                    folder_name = validate_name((data.get("name") or "").strip(), "Invalid folder name")
+                    parent_dir = resolve_safe_path(dir_rel)
+                    new_dir = os.path.join(parent_dir, folder_name)
+                    if os.path.exists(new_dir):
+                        raise ValueError(f"'{folder_name}' already exists")
+                    os.makedirs(new_dir)
+                    self.send_json(HTTPStatus.OK, {"ok": True})
 
-                processed = 0
-                for rel in items:
-                    src_path = resolve_safe_path(rel)
-                    if src_path == SERVER_ROOT:
-                        raise ValueError("Cannot copy or move root directory")
-                    if not os.path.exists(src_path) and not os.path.islink(src_path):
-                        continue
-                    basename = os.path.basename(src_path.rstrip("/\\"))
-                    if action == "copy":
-                        target_path = unique_dest_path(dest_dir, basename)
-                        if os.path.isdir(src_path) and not os.path.islink(src_path):
-                            if os.path.commonpath([src_path, target_path]) == src_path:
-                                raise ValueError(f"Cannot copy folder '{basename}' into itself")
-                            shutil.copytree(src_path, target_path, symlinks=True)
-                        else:
-                            shutil.copy2(src_path, target_path, follow_symlinks=False)
-                        processed += 1
-                    else:  # move
-                        target_path = os.path.join(dest_dir, basename)
-                        if os.path.abspath(src_path) == os.path.abspath(target_path):
-                            continue
-                        if os.path.exists(target_path) or os.path.islink(target_path):
-                            raise ValueError(f"'{basename}' already exists in destination")
-                        if os.path.isdir(src_path) and os.path.commonpath([src_path, dest_dir]) == src_path:
-                            raise ValueError(f"Cannot move folder '{basename}' into itself")
-                        shutil.move(src_path, target_path)
-                        processed += 1
+                elif action == "touch":
+                    dir_rel = data.get("dir", "/")
+                    file_name = validate_name((data.get("name") or "").strip(), "Invalid file name")
+                    if "." not in file_name:
+                        file_name += ".txt"
+                    parent_dir = resolve_safe_path(dir_rel)
+                    new_file = os.path.join(parent_dir, file_name)
+                    if os.path.exists(new_file) or os.path.islink(new_file):
+                        raise ValueError(f"'{file_name}' already exists")
+                    with open(new_file, "x", encoding="utf-8") as f:
+                        f.write("")
+                    rel_created = posixpath.join(dir_rel, file_name)
+                    self.send_json(HTTPStatus.OK, {"ok": True, "path": rel_created, "name": file_name})
 
-                self.send_json(HTTPStatus.OK, {"ok": True, "processed": processed})
+                elif action == "read_text":
+                    rel_path = data.get("path", "")
+                    target = resolve_safe_path(rel_path)
+                    if not os.path.isfile(target):
+                        raise ValueError("File does not exist")
+                    content, version, _ = read_text_version(target)
+                    self.send_json(HTTPStatus.OK, {"ok": True, "path": rel_path, "name": os.path.basename(target), "content": content, "version": version})
 
-            elif action == "mkdir":
-                dir_rel = data.get("dir", "/")
-                folder_name = validate_name((data.get("name") or "").strip(), "Invalid folder name")
-                parent_dir = resolve_safe_path(dir_rel)
-                new_dir = os.path.join(parent_dir, folder_name)
-                if os.path.exists(new_dir):
-                    raise ValueError(f"'{folder_name}' already exists")
-                os.makedirs(new_dir)
-                self.send_json(HTTPStatus.OK, {"ok": True})
+                elif action == "write_text":
+                    target = resolve_safe_path(data.get("path", ""))
+                    if not os.path.isfile(target):
+                        raise ValueError("File does not exist")
+                    version = save_text(target, data.get("content", ""), data.get("version"))
+                    self.send_json(HTTPStatus.OK, {"ok": True, "version": version})
 
-            elif action == "touch":
-                dir_rel = data.get("dir", "/")
-                file_name = validate_name((data.get("name") or "").strip(), "Invalid file name")
-                if "." not in file_name:
-                    file_name += ".txt"
-                parent_dir = resolve_safe_path(dir_rel)
-                new_file = os.path.join(parent_dir, file_name)
-                if os.path.exists(new_file) or os.path.islink(new_file):
-                    raise ValueError(f"'{file_name}' already exists")
-                with open(new_file, "w", encoding="utf-8") as f:
-                    f.write("")
-                rel_created = posixpath.join(dir_rel, file_name)
-                self.send_json(HTTPStatus.OK, {"ok": True, "path": rel_created, "name": file_name})
+                elif action == "upload_conflicts":
+                    parent = resolve_safe_path(data.get("dir", "/"))
+                    names = data.get("names", [])
+                    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+                        raise ValueError("Upload names must be a list of strings")
+                    conflicts = [name for name in names if os.path.lexists(os.path.join(parent, validate_name(name, "Invalid filename")))]
+                    self.send_json(HTTPStatus.OK, {"ok": True, "conflicts": conflicts})
 
-            elif action == "read_text":
-                rel_path = data.get("path", "")
-                target = resolve_safe_path(rel_path)
-                if not os.path.isfile(target):
-                    raise ValueError("File does not exist")
-                size = os.path.getsize(target)
-                if size > 2 * 1024 * 1024:
-                    raise ValueError("File is larger than 2 MB; download to edit locally")
-                with open(target, "r", encoding="utf-8", errors="replace") as f:
-                    content = f.read()
-                self.send_json(
-                    HTTPStatus.OK,
-                    {"ok": True, "path": rel_path, "name": os.path.basename(target), "content": content},
-                )
+                elif action == "directory_size":
+                    target = resolve_safe_path(data.get("path", "/"))
+                    if not os.path.isdir(target):
+                        raise ValueError("Path is not a directory")
+                    size = files = skipped = 0
+                    stack = [target]
+                    while stack:
+                        directory = stack.pop()
+                        try:
+                            resolve_safe_path(os.path.relpath(directory, SERVER_ROOT))
+                            with os.scandir(directory) as entries:
+                                for entry in entries:
+                                    if entry.name.startswith(TEMP_PREFIX) or entry.is_symlink():
+                                        skipped += 1
+                                        continue
+                                    try:
+                                        if entry.is_dir(follow_symlinks=False):
+                                            stack.append(entry.path)
+                                        elif entry.is_file(follow_symlinks=False):
+                                            size += entry.stat(follow_symlinks=False).st_size
+                                            files += 1
+                                        else:
+                                            skipped += 1
+                                    except OSError:
+                                        skipped += 1
+                        except (OSError, ValueError):
+                            skipped += 1
+                    self.send_json(HTTPStatus.OK, {"ok": True, "bytes": size, "files": files, "skipped": skipped})
 
-            elif action == "write_text":
-                rel_path = data.get("path", "")
-                content = data.get("content", "")
-                target = resolve_safe_path(rel_path)
-                if os.path.isdir(target):
-                    raise ValueError("Cannot overwrite a directory with text")
-                with open(target, "w", encoding="utf-8") as f:
-                    f.write(content)
-                self.send_json(HTTPStatus.OK, {"ok": True})
+                elif action == "extract":
+                    src_rel = data.get("src", "")
+                    src_path = resolve_safe_path(src_rel)
+                    if not os.path.isfile(src_path):
+                        raise ValueError("Archive file not found")
+                    parent_dir = os.path.dirname(src_path)
+                    folder_stem = strip_archive_suffix(os.path.basename(src_path))
+                    extract_dir = unique_dest_path(parent_dir, folder_stem)
+                    stage = tempfile.mkdtemp(dir=parent_dir, prefix=TEMP_PREFIX)
+                    try:
+                        safe_extract_archive(src_path, stage)
+                        os.rename(stage, extract_dir)
+                    finally:
+                        if os.path.exists(stage):
+                            shutil.rmtree(stage, ignore_errors=True)
+                    self.send_json(
+                        HTTPStatus.OK,
+                        {"ok": True, "extracted_to": os.path.basename(extract_dir)},
+                    )
 
-            elif action == "extract":
-                src_rel = data.get("src", "")
-                src_path = resolve_safe_path(src_rel)
-                if not os.path.isfile(src_path):
-                    raise ValueError("Archive file not found")
-                parent_dir = os.path.dirname(src_path)
-                folder_stem = strip_archive_suffix(os.path.basename(src_path))
-                extract_dir = unique_dest_path(parent_dir, folder_stem)
-                os.makedirs(extract_dir, exist_ok=True)
-                try:
-                    safe_extract_archive(src_path, extract_dir)
-                except Exception:
-                    shutil.rmtree(extract_dir, ignore_errors=True)
-                    raise
-                self.send_json(
-                    HTTPStatus.OK,
-                    {"ok": True, "extracted_to": os.path.basename(extract_dir)},
-                )
-
-            else:
-                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Unknown action: {action}"})
+                else:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Unknown action: {action}"})
         except Exception as exc:
-            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            self.send_json(getattr(exc, "status", HTTPStatus.BAD_REQUEST), {"ok": False, "error": str(exc)})
 
     def send_range_response(self, path: str, range_header: str):
         try:
             file_size = os.path.getsize(path)
-            m = re.match(r"bytes=(\d*)-(\d*)", range_header)
-            if not m:
-                self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                return
-
-            start_str, end_str = m.groups()
-            start = int(start_str) if start_str else 0
-            end = int(end_str) if end_str else file_size - 1
-            if start >= file_size or start > end:
+            match = re.fullmatch(r"bytes=([0-9]{0,20})-([0-9]{0,20})", range_header)
+            start = end = 0
+            valid = bool(match and any(match.groups()) and file_size)
+            if valid:
+                first, last = match.groups()
+                if first:
+                    start = int(first)
+                    end = min(int(last), file_size - 1) if last else file_size - 1
+                    valid = start < file_size and start <= end
+                else:
+                    suffix = int(last)
+                    valid = suffix > 0
+                    start, end = max(0, file_size - suffix), file_size - 1
+            if not valid:
                 self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
                 self.send_header("Content-Range", f"bytes */{file_size}")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
 
-            end = min(end, file_size - 1)
             length = end - start + 1
             ctype = self.guess_type(path)
 
@@ -598,7 +846,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
     def list_directory(self, path: str):
         try:
-            entries = os.listdir(path)
+            entries = [name for name in os.listdir(path) if not name.startswith(TEMP_PREFIX)]
         except OSError:
             self.send_error(HTTPStatus.NOT_FOUND, "No permission to list directory")
             return None
@@ -626,10 +874,10 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         file_count = 0
         for name in entries:
             full_path = os.path.join(path, name)
-            is_dir = os.path.isdir(full_path)
             is_link = os.path.islink(full_path)
+            is_dir = not is_link and os.path.isdir(full_path)
             try:
-                st = os.stat(full_path)
+                st = os.lstat(full_path)
                 size = st.st_size if not is_dir else -1
                 mtime = st.st_mtime
             except OSError:
@@ -642,8 +890,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 file_count += 1
 
             badge, css_class = classify_file(name, is_dir, is_link)
-            editable = 1 if is_text_editable(name, is_dir) else 0
-            extractable = 1 if is_extractable_archive(name, is_dir) else 0
+            editable = int(not is_link and is_text_editable(name, is_dir))
+            extractable = int(not is_link and is_extractable_archive(name, is_dir))
             preview_kind = ""
             if css_class == "ft-img":
                 preview_kind = "image"
@@ -666,6 +914,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 "href": href,
                 "rel_path": rel_item_path,
                 "is_dir": 1 if is_dir else 0,
+                "is_link": int(is_link),
                 "editable": editable,
                 "extractable": extractable,
                 "preview": preview_kind,
@@ -700,9 +949,14 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
             hidden_attr = ' data-hidden="1"' if it["hidden"] else ""
             esc_rel = html.escape(it["rel_path"], quote=True)
             esc_raw_name = html.escape(it["name"], quote=True)
+            size_html = (
+                f'<button type="button" class="btn dir-size-btn" aria-label="Calculate size of {esc_raw_name}" title="Calculate directory size; symbolic links are skipped">Size</button>'
+                if it["is_dir"] else it["size_str"]
+            )
             rows_html.append(
                 f'<tr class="item-row"{hidden_attr} '
                 f'data-isdir="{it["is_dir"]}" '
+                f'data-islink="{it["is_link"]}" '
                 f'data-editable="{it["editable"]}" '
                 f'data-extractable="{it["extractable"]}" '
                 f'data-preview="{it["preview"]}" '
@@ -720,7 +974,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 f'<span class="badge badge-{it["css_class"]}">{it["badge"]}</span>'
                 f'<span class="fname">{html.escape(it["display_name"])}</span>'
                 f"</a></td>"
-                f'<td class="col-size">{it["size_str"]}</td>'
+                f'<td class="col-size">{size_html}</td>'
                 f'<td class="col-date">{it["mtime_str"]}</td>'
                 f"</tr>"
             )
@@ -728,7 +982,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         rows_str = "\n".join(rows_html)
         enc = sys.getfilesystemencoding()
         title = html.escape(url_path)
-        current_dir_js = json.dumps(url_path)
+        current_dir_js = json.dumps(url_path).replace("<", "\\u003c")
 
         # Storage usage calculation for the current directory's filesystem
         try:
@@ -1139,6 +1393,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     font-size: 12.5px;
   }}
   .col-size {{ text-align: right; width: 110px; }}
+  .dir-size-btn {{ font-size: 11px; padding: 3px 7px; }}
   .col-date {{ text-align: right; width: 155px; }}
   .badge {{
     display: inline-block;
@@ -1274,8 +1529,32 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     color: var(--code);
     word-break: break-all;
   }}
+  .editor-body {{
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    overflow: hidden;
+    background: #090b0f;
+    position: relative;
+  }}
+  .editor-gutter {{
+    background: #0b0e14;
+    color: var(--muted);
+    border-right: 1px solid var(--border);
+    padding: 14px 10px 14px 12px;
+    font-family: inherit;
+    font-size: 13.5px;
+    line-height: 1.55;
+    text-align: right;
+    user-select: none;
+    overflow: hidden;
+    min-width: 48px;
+    white-space: pre;
+    flex-shrink: 0;
+  }}
   .editor-textarea {{
     flex: 1;
+    min-width: 0;
     width: 100%;
     background: #090b0f;
     color: var(--text);
@@ -1287,6 +1566,15 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     resize: none;
     outline: none;
     tab-size: 2;
+    white-space: pre;
+    overflow-wrap: normal;
+    overflow-x: auto;
+    overflow-y: auto;
+  }}
+  .editor-textarea[readonly] {{
+    background: #0b0d12;
+    color: var(--file);
+    cursor: default;
   }}
   .editor-footer-left {{
     display: flex;
@@ -1325,7 +1613,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     padding: 12px;
     overflow: hidden;
     user-select: none;
+    touch-action: pan-y pinch-zoom;
   }}
+  .lightbox-modal.is-fullscreen {{ position: fixed; inset: 0; }}
   .lightbox-modal:fullscreen .lightbox-body,
   .lightbox-modal.is-fullscreen .lightbox-body {{
     max-height: calc(100vh - 54px);
@@ -1349,12 +1639,12 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     width: min(480px, 90%);
     z-index: 1;
   }}
-  /* Left & Right Edge Tap Zones for Media Navigation */
+  /* Narrow edge taps leave the center and bottom media controls accessible. */
   .edge-tap-zone {{
     position: absolute;
     top: 0;
     bottom: 56px;
-    width: 22%;
+    width: 11%;
     z-index: 5;
     cursor: pointer;
     display: flex;
@@ -1366,13 +1656,13 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   .edge-tap-zone.edge-left {{
     left: 0;
     justify-content: flex-start;
-    padding-left: 14px;
+    padding-left: 10px;
     background: linear-gradient(90deg, rgba(0, 0, 0, 0.35), transparent);
   }}
   .edge-tap-zone.edge-right {{
     right: 0;
     justify-content: flex-end;
-    padding-right: 14px;
+    padding-right: 10px;
     background: linear-gradient(270deg, rgba(0, 0, 0, 0.35), transparent);
   }}
   .edge-tap-zone:hover,
@@ -1381,13 +1671,13 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }}
   .edge-chevron {{
     color: rgba(226, 232, 240, 0.75);
-    font-size: 20px;
+    font-size: 18px;
     font-weight: 700;
-    background: rgba(19, 23, 32, 0.7);
+    background: rgba(19, 23, 32, 0.72);
     border: 1px solid var(--border);
     border-radius: 999px;
-    width: 34px;
-    height: 34px;
+    width: 30px;
+    height: 30px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1474,7 +1764,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       <div class="storage-meter">
         <div id="uploadFill" class="storage-fill fill-neutral" style="width: 0%"></div>
       </div>
-      <span id="uploadText">0 B / 0 B (0%)</span>
+      <span id="uploadText" role="status" aria-live="polite">0 B / 0 B (0%)</span>
+      <button type="button" id="cancelUploadBtn" class="btn btn-danger">Cancel upload</button>
     </div>
   </div>
   <div class="table-wrap">
@@ -1512,6 +1803,14 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       <input type="checkbox" id="modalExtraCheck" checked>
       <span id="modalCheckLabel">Open in editor after creation</span>
     </label>
+    <label id="uploadPolicyRow" style="display:none">
+      Existing files
+      <select id="uploadPolicy" class="modal-input">
+        <option value="keep">Keep both</option>
+        <option value="skip">Skip existing files</option>
+        <option value="replace">Replace existing files</option>
+      </select>
+    </label>
     <div class="modal-actions">
       <button type="button" class="btn" id="modalCancelBtn">Cancel</button>
       <button type="button" class="btn btn-primary" id="modalConfirmBtn">Confirm</button>
@@ -1529,17 +1828,21 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         <a id="editorRawLink" href="#" download class="btn btn-icon" title="Download file" aria-label="Download file">
           <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         </a>
-        <button type="button" id="editorSaveBtn" class="btn btn-primary">Save</button>
+        <button type="button" id="editorEditBtn" class="btn btn-primary">Edit</button>
+        <button type="button" id="editorSaveBtn" class="btn btn-primary" style="display:none">Save</button>
         <button type="button" id="editorCloseBtn" class="btn">Close</button>
       </div>
     </div>
-    <textarea id="editorTextarea" class="editor-textarea" spellcheck="false"></textarea>
+    <div class="editor-body">
+      <div id="editorGutter" class="editor-gutter" aria-hidden="true">1</div>
+      <textarea id="editorTextarea" class="editor-textarea" aria-label="File contents" spellcheck="false" wrap="off" readonly></textarea>
+    </div>
     <div class="editor-footer">
       <div class="editor-footer-left">
         <span id="editorCursorPos" class="cursor-pos">Ln 1, Col 1</span>
         <span id="editorStats">0 lines, 0 chars</span>
       </div>
-      <span id="editorStatus">Ctrl+S to save</span>
+      <span id="editorStatus">Read-only mode</span>
     </div>
   </div>
 </div>
@@ -1556,8 +1859,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         <a id="lightboxDownloadLink" href="#" download class="btn btn-icon" title="Download file" aria-label="Download file">
           <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         </a>
-        <button type="button" id="lightboxFullscreenBtn" class="btn btn-icon" title="Toggle Fullscreen" aria-label="Toggle Fullscreen">
-          <svg viewBox="0 0 24 24"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+        <button type="button" id="lightboxFullscreenBtn" class="btn btn-icon" title="Enter fullscreen" aria-label="Enter fullscreen" aria-pressed="false">
+          <svg id="fsIconExpand" aria-hidden="true" viewBox="0 0 24 24"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+          <svg id="fsIconCompress" aria-hidden="true" viewBox="0 0 24 24" style="display:none"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
         </button>
         <button type="button" id="lightboxCloseBtn" class="btn" title="Close">✕</button>
       </div>
@@ -1596,6 +1900,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   const uploadBar = byId('uploadBar');
   const uploadFill = byId('uploadFill');
   const uploadText = byId('uploadText');
+  const cancelUploadBtn = byId('cancelUploadBtn');
+  let activeUpload = null;
 
   const tbody = byId('fileBody');
   const rows = Array.from(tbody.querySelectorAll('.item-row'));
@@ -1622,6 +1928,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   const modalTitle = byId('modalTitle');
   const modalDesc = byId('modalDesc');
   const modalInput = byId('modalInput');
+  const uploadPolicyRow = byId('uploadPolicyRow');
+  const uploadPolicy = byId('uploadPolicy');
   const modalCheckRow = byId('modalCheckRow');
   const modalExtraCheck = byId('modalExtraCheck');
   const modalCheckLabel = byId('modalCheckLabel');
@@ -1632,6 +1940,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   const editorTitle = byId('editorTitle');
   const editorOpenLink = byId('editorOpenLink');
   const editorRawLink = byId('editorRawLink');
+  const editorEditBtn = byId('editorEditBtn');
+  const editorGutter = byId('editorGutter');
   const editorSaveBtn = byId('editorSaveBtn');
   const editorCloseBtn = byId('editorCloseBtn');
   const editorTextarea = byId('editorTextarea');
@@ -1641,6 +1951,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
   const lightboxBackdrop = byId('lightboxBackdrop');
   const lightboxModal = byId('lightboxModal');
+  const lightboxBody = byId('lightboxBody');
+  const fsIconExpand = byId('fsIconExpand');
+  const fsIconCompress = byId('fsIconCompress');
   const lightboxTitle = byId('lightboxTitle');
   const lightboxMediaSlot = byId('lightboxMediaSlot');
   const edgeTapLeft = byId('edgeTapLeft');
@@ -1660,6 +1973,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   let modalHandler = null;
 
   let currentEditorPath = null;
+  let currentEditorVersion = null;
+  let editorIsEditing = false;
+  let lastGutterLineCount = 0;
   let editorDirty = false;
   let editorReloadOnClose = false;
 
@@ -1710,41 +2026,70 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }});
 
   // Upload files with top progress bar (via button or drag & drop)
-  function uploadFileList(files) {{
+  async function uploadFileList(files) {{
     if (!files || !files.length) return;
+    if (activeUpload) {{ alert('An upload is already in progress'); return; }}
+    files = Array.from(files);
+    try {{
+      const data = await apiCall({{ action: 'upload_conflicts', dir: CURRENT_DIR, names: files.map(f => f.name) }});
+      if (data.conflicts.length) {{
+        openModal({{
+          title: 'Files already exist',
+          desc: `Choose how to handle existing files: ${{data.conflicts.join(', ')}}`,
+          showInput: false,
+          showUploadPolicy: true,
+          confirmLabel: 'Upload',
+          onConfirm: () => {{ startUpload(files, uploadPolicy.value); return false; }},
+        }});
+      }} else {{
+        startUpload(files, 'keep');
+      }}
+    }} catch (err) {{ alert(err.message); }}
+  }}
+
+  function startUpload(files, policy) {{
+    if (activeUpload) return;
     const formData = new FormData();
-    for (const f of files) {{
-      formData.append('file', f);
-    }}
-    const xhr = new XMLHttpRequest();
+    files.forEach(f => formData.append('file', f));
+    const xhr = activeUpload = new XMLHttpRequest();
     uploadBar.style.display = 'inline-flex';
     uploadFill.style.width = '0%';
     uploadText.textContent = 'Uploading...';
-
+    cancelUploadBtn.disabled = false;
     xhr.upload.addEventListener('progress', (e) => {{
       if (!e.lengthComputable) return;
       const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
       uploadFill.style.width = `${{pct}}%`;
-      uploadText.textContent = `${{formatBytes(e.loaded)}} / ${{formatBytes(e.total)}} (${{pct}}%)`;
+      uploadText.textContent = pct === 100 ? 'Finishing upload...' : `${{formatBytes(e.loaded)}} / ${{formatBytes(e.total)}} (${{pct}}%)`;
     }});
-
     xhr.addEventListener('load', () => {{
-      if (xhr.status >= 200 && xhr.status < 400) {{
+      activeUpload = null;
+      cancelUploadBtn.disabled = true;
+      try {{
+        const data = JSON.parse(xhr.responseText);
+        if (xhr.status < 200 || xhr.status >= 300 || !data.ok) throw new Error(data.error || 'Upload failed');
+        showResults(data);
         window.location.reload();
-      }} else {{
-        alert('Upload failed');
-        uploadBar.style.display = 'none';
+      }} catch (err) {{
+        uploadText.textContent = err.message;
       }}
     }});
-
     xhr.addEventListener('error', () => {{
-      alert('Upload error');
-      uploadBar.style.display = 'none';
+      activeUpload = null;
+      cancelUploadBtn.disabled = true;
+      uploadText.textContent = 'Connection lost. Refresh to check completed files before retrying.';
     }});
-
+    xhr.addEventListener('abort', () => {{
+      activeUpload = null;
+      cancelUploadBtn.disabled = true;
+      uploadText.textContent = 'Upload cancelled. Refresh to check whether it had already completed.';
+    }});
     xhr.open('POST', window.location.pathname);
+    xhr.setRequestHeader('X-Upload-Conflict', policy);
     xhr.send(formData);
   }}
+
+  cancelUploadBtn.addEventListener('click', () => {{ if (activeUpload) activeUpload.abort(); }});
 
   menuUploadBtn.addEventListener('click', () => {{
     dropdownMenu.classList.remove('open');
@@ -1752,6 +2097,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }});
   fileUpload.addEventListener('change', () => {{
     if (fileUpload.files.length > 0) uploadFileList(fileUpload.files);
+    fileUpload.value = '';
   }});
 
   // Drag & Drop upload anywhere on window
@@ -1834,7 +2180,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     actZipBtn.disabled = count === 0;
     actDeleteBtn.disabled = count === 0;
     actRenameBtn.disabled = count !== 1;
-    actEditBtn.disabled = !(count === 1 && selected[0].dataset.isdir === '0');
+    actEditBtn.disabled = !(count === 1 && selected[0].dataset.isdir === '0' && selected[0].dataset.islink !== '1');
     actExtractBtn.disabled = !(count === 1 && selected[0].dataset.extractable === '1');
     selectAllCheck.checked = visible.length > 0 && visible.every(r => r.querySelector('.row-check').checked);
     selectAllCheck.indeterminate = count > 0 && !selectAllCheck.checked;
@@ -1844,6 +2190,23 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     const cb = r.querySelector('.row-check');
     const link = r.querySelector('.row-link');
     cb.addEventListener('change', updateSelectionUI);
+    const sizeButton = r.querySelector('.dir-size-btn');
+    if (sizeButton) sizeButton.addEventListener('click', async (e) => {{
+      e.stopPropagation();
+      sizeButton.disabled = true;
+      sizeButton.textContent = '...';
+      try {{
+        const data = await apiCall({{ action: 'directory_size', path: r.dataset.path }});
+        sizeButton.textContent = `${{data.skipped ? '≈ ' : ''}}${{formatBytes(data.bytes)}}`;
+        sizeButton.title = `${{data.files}} files; ${{data.skipped}} links or unreadable entries skipped. Click to recalculate.`;
+        sizeButton.setAttribute('aria-label', `${{r.dataset.rawname}}: ${{sizeButton.textContent}}. Click to recalculate.`);
+        r.dataset.size = String(data.bytes);
+      }} catch (err) {{
+        sizeButton.textContent = 'Retry';
+        sizeButton.title = err.message;
+        alert(err.message);
+      }} finally {{ sizeButton.disabled = false; }}
+    }});
     link.addEventListener('click', (e) => {{
       if (selectMode) {{
         e.preventDefault();
@@ -1927,17 +2290,29 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     return data;
   }}
 
+  function showResults(data) {{
+    const results = data.results || [];
+    const count = status => results.filter(r => r.status === status).length;
+    const summary = `${{count('success')}} succeeded, ${{count('failed')}} failed, ${{count('skipped')}} skipped`;
+    const details = results.slice(0, 50).map(r => `${{r.path}}: ${{r.status}}${{r.error ? ' — ' + r.error : r.name ? ' → ' + r.name : ''}}`);
+    if (results.length > 50) details.push(`...and ${{results.length - 50}} more items`);
+    alert([summary, ...details].join('\\n'));
+  }}
+
   pasteHereBtn.addEventListener('click', async () => {{
     const clip = getClipboard();
     if (!clip || !clip.items.length) return;
     pasteHereBtn.disabled = true;
     try {{
-      await apiCall({{
+      const result = await apiCall({{
         action: clip.mode,
         items: clip.items,
         dest_dir: CURRENT_DIR,
       }});
-      clearClipboard();
+      showResults(result);
+      const pending = result.results.filter(r => r.status !== 'success').map(r => r.path);
+      if (pending.length) setClipboard(clip.mode, pending);
+      else clearClipboard();
       window.location.reload();
     }} catch (err) {{
       alert(err.message);
@@ -1975,14 +2350,53 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     if (sel.length !== 1) return;
     const r = sel[0];
     setSelectMode(false);
-    openEditor(r.dataset.path, r.dataset.rawname, r.dataset.href, false);
+    openEditor(r.dataset.path, r.dataset.rawname, r.dataset.href, false, true);
   }});
 
   // Inline Text Viewer / Editor functions
+  function setEditorMode(editing) {{
+    editorIsEditing = Boolean(editing);
+    editorTextarea.readOnly = !editorIsEditing;
+    editorEditBtn.style.display = editorIsEditing ? 'none' : 'inline-flex';
+    editorSaveBtn.style.display = editorIsEditing ? 'inline-flex' : 'none';
+    if (editorIsEditing) {{
+      editorStatus.textContent = editorDirty ? 'Unsaved changes' : 'Editing — Ctrl+S to save';
+      editorTextarea.focus();
+    }} else {{
+      editorStatus.textContent = 'Read-only mode';
+    }}
+  }}
+
+  editorEditBtn.addEventListener('click', () => {{
+    setEditorMode(true);
+  }});
+
+  function updateEditorGutter(lineCount) {{
+    const count = Math.max(1, lineCount);
+    if (count !== lastGutterLineCount) {{
+      lastGutterLineCount = count;
+      const nums = new Array(count);
+      for (let i = 0; i < count; i++) nums[i] = i + 1;
+      editorGutter.textContent = nums.join('\\n');
+    }}
+  }}
+
+  function syncEditorGutter() {{
+    // A horizontal scrollbar shortens the textarea viewport; match its scroll range.
+    const scrollbar = Math.max(0, editorTextarea.offsetHeight - editorTextarea.clientHeight);
+    editorGutter.style.paddingBottom = `${{14 + scrollbar}}px`;
+    editorGutter.scrollTop = editorTextarea.scrollTop;
+  }}
+
+  editorTextarea.addEventListener('scroll', syncEditorGutter);
+  window.addEventListener('resize', syncEditorGutter);
+
   function updateEditorStats() {{
     const val = editorTextarea.value;
     const lines = val ? val.split('\\n').length : 1;
     editorStats.textContent = `${{lines}} line${{lines === 1 ? '' : 's'}}, ${{val.length}} chars`;
+    updateEditorGutter(lines);
+    syncEditorGutter();
     updateEditorCursorPos();
   }}
 
@@ -2007,23 +2421,27 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     editorCursorPos.textContent = `Ln ${{startLine}}, Col ${{startCol}}`;
   }}
 
-  async function openEditor(relPath, displayName, rawHref, reloadOnClose) {{
+  async function openEditor(relPath, displayName, rawHref, reloadOnClose, startInEditMode = false) {{
     try {{
       const data = await apiCall({{ action: 'read_text', path: relPath }});
       currentEditorPath = relPath;
+      currentEditorVersion = data.version;
       editorReloadOnClose = Boolean(reloadOnClose);
       editorDirty = false;
+      lastGutterLineCount = 0;
       const targetHref = rawHref || encodeURIComponent(data.name);
       editorTitle.textContent = data.name || displayName;
       editorOpenLink.href = targetHref;
       editorRawLink.href = targetHref;
       editorTextarea.value = data.content || '';
+      editorTextarea.scrollTop = editorTextarea.scrollLeft = editorGutter.scrollTop = 0;
       editorTextarea.setSelectionRange(0, 0);
-      editorStatus.textContent = 'Ctrl+S to save';
+      setEditorMode(startInEditMode);
       updateEditorStats();
       editorBackdrop.classList.add('open');
       setTimeout(() => {{
-        editorTextarea.focus();
+        if (startInEditMode) editorTextarea.focus();
+        syncEditorGutter();
         updateEditorCursorPos();
       }}, 20);
     }} catch (err) {{
@@ -2032,19 +2450,22 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }}
 
   async function saveEditorContent() {{
-    if (!currentEditorPath) return;
+    if (!currentEditorPath || !editorIsEditing || editorSaveBtn.disabled) return;
+    const savedContent = editorTextarea.value;
     editorSaveBtn.disabled = true;
     editorStatus.textContent = 'Saving...';
     try {{
-      await apiCall({{
+      const data = await apiCall({{
         action: 'write_text',
         path: currentEditorPath,
-        content: editorTextarea.value,
+        content: savedContent,
+        version: currentEditorVersion,
       }});
-      editorDirty = false;
+      currentEditorVersion = data.version;
+      editorDirty = editorTextarea.value !== savedContent;
       editorReloadOnClose = true;
-      editorTitle.textContent = editorTitle.textContent.replace(/\\*$/, '');
-      editorStatus.textContent = 'Saved ✓';
+      editorTitle.textContent = editorTitle.textContent.replace(/\\*$/, '') + (editorDirty ? '*' : '');
+      editorStatus.textContent = editorDirty ? 'Earlier changes saved; newer edits are unsaved' : 'Saved ✓';
     }} catch (err) {{
       alert(err.message);
       editorStatus.textContent = 'Save failed';
@@ -2054,6 +2475,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }}
 
   function closeEditor() {{
+    if (editorSaveBtn.disabled) {{ alert('Please wait for the save to finish'); return; }}
     if (editorDirty && !confirm('Discard unsaved changes?')) return;
     editorBackdrop.classList.remove('open');
     currentEditorPath = null;
@@ -2063,6 +2485,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }}
 
   editorTextarea.addEventListener('input', () => {{
+    if (!editorIsEditing) return;
     if (!editorDirty) {{
       editorDirty = true;
       if (!editorTitle.textContent.endsWith('*')) {{
@@ -2081,7 +2504,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {{
       e.preventDefault();
       saveEditorContent();
-    }} else if (e.key === 'Tab') {{
+    }} else if (editorIsEditing && e.key === 'Tab') {{
       e.preventDefault();
       const start = editorTextarea.selectionStart;
       const end = editorTextarea.selectionEnd;
@@ -2097,11 +2520,24 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }});
 
   // Lightbox functions (Images, Video, Audio)
+  function syncFullscreenIcon() {{
+    const active = document.fullscreenElement === lightboxModal || lightboxModal.classList.contains('is-fullscreen');
+    fsIconExpand.style.display = active ? 'none' : 'block';
+    fsIconCompress.style.display = active ? 'block' : 'none';
+    lightboxFullscreenBtn.setAttribute('aria-pressed', String(active));
+    lightboxFullscreenBtn.setAttribute('aria-label', active ? 'Exit fullscreen' : 'Enter fullscreen');
+    lightboxFullscreenBtn.title = active ? 'Exit fullscreen' : 'Enter fullscreen';
+  }}
+
+  document.addEventListener('fullscreenchange', syncFullscreenIcon);
+
   function openLightboxForRow(targetRow) {{
     lightboxItems = getVisibleRows().filter(r => Boolean(r.dataset.preview));
     lightboxIndex = lightboxItems.indexOf(targetRow);
     if (lightboxIndex === -1) return;
+    resetSwipe();
     renderLightboxItem();
+    syncFullscreenIcon();
     lightboxBackdrop.classList.add('open');
   }}
 
@@ -2136,25 +2572,28 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }}
 
   async function toggleLightboxFullscreen() {{
-    if (document.fullscreenElement) {{
+    if (document.fullscreenElement === lightboxModal) {{
       try {{ await document.exitFullscreen(); }} catch {{}}
+    }} else if (lightboxModal.classList.contains('is-fullscreen')) {{
       lightboxModal.classList.remove('is-fullscreen');
-      return;
-    }}
-    if (lightboxModal.requestFullscreen) {{
+    }} else {{
       try {{
+        if (!lightboxModal.requestFullscreen) throw new Error('Fullscreen API unavailable');
         await lightboxModal.requestFullscreen();
-        return;
-      }} catch {{}}
+      }} catch {{
+        lightboxModal.classList.add('is-fullscreen');
+      }}
     }}
-    lightboxModal.classList.toggle('is-fullscreen');
+    syncFullscreenIcon();
   }}
 
-  function closeLightbox() {{
-    if (document.fullscreenElement) {{
-      try {{ document.exitFullscreen(); }} catch {{}}
+  async function closeLightbox() {{
+    if (document.fullscreenElement === lightboxModal) {{
+      try {{ await document.exitFullscreen(); }} catch {{}}
     }}
     lightboxModal.classList.remove('is-fullscreen');
+    syncFullscreenIcon();
+    resetSwipe();
     lightboxMediaSlot.innerHTML = '';
     lightboxBackdrop.classList.remove('open');
     lightboxIndex = -1;
@@ -2170,17 +2609,65 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   lightboxNextBtn.addEventListener('click', () => stepLightbox(1));
   edgeTapLeft.addEventListener('click', (e) => {{
     e.stopPropagation();
-    stepLightbox(-1);
+    if (Date.now() >= suppressEdgeTapUntil) stepLightbox(-1);
   }});
   edgeTapRight.addEventListener('click', (e) => {{
     e.stopPropagation();
-    stepLightbox(1);
+    if (Date.now() >= suppressEdgeTapUntil) stepLightbox(1);
   }});
   lightboxFullscreenBtn.addEventListener('click', toggleLightboxFullscreen);
   lightboxCloseBtn.addEventListener('click', closeLightbox);
   lightboxBackdrop.addEventListener('click', (e) => {{
     if (e.target === lightboxBackdrop) closeLightbox();
   }});
+
+  // Swipe only once per single-finger gesture; pinch/vertical/control gestures pass through.
+  let swipeStart = null;
+  let multiTouchActive = false;
+  let suppressEdgeTapUntil = 0;
+
+  function resetSwipe() {{
+    swipeStart = null;
+    multiTouchActive = false;
+  }}
+
+  lightboxBody.addEventListener('touchstart', (e) => {{
+    if (e.touches.length !== 1 || multiTouchActive) {{
+      multiTouchActive = true;
+      swipeStart = null;
+      return;
+    }}
+    const touch = e.touches[0];
+    const control = e.target && e.target.closest && e.target.closest('audio, video, button, a, input, select');
+    if (control && (control.tagName !== 'VIDEO' || touch.clientY >= control.getBoundingClientRect().bottom - 56)) {{
+      swipeStart = null;
+      return;
+    }}
+    swipeStart = {{ id: touch.identifier, x: touch.clientX, y: touch.clientY }};
+  }}, {{ passive: true }});
+
+  lightboxBody.addEventListener('touchmove', (e) => {{
+    if (e.touches.length > 1) {{ multiTouchActive = true; swipeStart = null; }}
+  }}, {{ passive: true }});
+
+  lightboxBody.addEventListener('touchend', (e) => {{
+    const start = swipeStart;
+    swipeStart = null;
+    if (multiTouchActive) {{
+      if (!e.touches.length) multiTouchActive = false;
+      return;
+    }}
+    if (!start || e.touches.length) return;
+    const end = Array.from(e.changedTouches || []).find(t => t.identifier === start.id);
+    if (!end) return;
+    const dx = end.clientX - start.x;
+    const dy = end.clientY - start.y;
+    if (Math.abs(dx) > 48 && Math.abs(dx) > Math.abs(dy) * 1.5) {{
+      suppressEdgeTapUntil = Date.now() + 400;
+      stepLightbox(dx < 0 ? 1 : -1);
+    }}
+  }}, {{ passive: true }});
+  lightboxBody.addEventListener('touchcancel', resetSwipe, {{ passive: true }});
 
   // Modal helpers (Rename, New Folder, New Text File, Delete)
   function openModal({{
@@ -2189,6 +2676,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     defaultValue = '',
     showInput = true,
     showCheckbox = false,
+    showUploadPolicy = false,
     checkboxLabel = 'Open in editor after creation',
     checkboxDefault = true,
     danger = false,
@@ -2199,6 +2687,8 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     modalDesc.textContent = desc;
     modalInput.style.display = showInput ? 'block' : 'none';
     modalInput.value = defaultValue;
+    uploadPolicyRow.style.display = showUploadPolicy ? 'block' : 'none';
+    uploadPolicy.value = 'keep';
     modalCheckRow.classList.toggle('visible', Boolean(showCheckbox));
     modalCheckLabel.textContent = checkboxLabel;
     modalExtraCheck.checked = Boolean(checkboxDefault);
@@ -2284,7 +2774,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       danger: true,
       confirmLabel: 'Delete',
       onConfirm: async () => {{
-        await apiCall({{ action: 'delete', items: sel.map(r => r.dataset.path) }});
+        showResults(await apiCall({{ action: 'delete', items: sel.map(r => r.dataset.path) }}));
       }},
     }});
   }});
@@ -2316,7 +2806,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         if (!rawName) throw new Error('File name is required');
         const res = await apiCall({{ action: 'touch', dir: CURRENT_DIR, name: rawName }});
         if (openAfter) {{
-          await openEditor(res.path, res.name, encodeURIComponent(res.name), true);
+          await openEditor(res.path, res.name, encodeURIComponent(res.name), true, true);
           return false; // Wait until editor closes to reload list
         }}
         return true;
@@ -2422,7 +2912,7 @@ def main():
     parser.add_argument("-a", "--auth", default=None, help="Optional Basic Auth credentials in USER:PASS format")
     args = parser.parse_args()
 
-    SERVER_ROOT = os.path.abspath(os.path.expanduser(args.directory))
+    SERVER_ROOT = os.path.realpath(os.path.expanduser(args.directory))
     os.chdir(SERVER_ROOT)
 
     if args.auth:
