@@ -23,6 +23,11 @@ and use a trusted network; Basic Authentication does not encrypt HTTP traffic.
 
 - Dark interface with breadcrumbs, filtering, sorting, and optional dotfile display.
 - Select mode with copy, move, rename, edit, and delete.
+- Short operation messages appear in the top-right progress area. Click a message
+  to open all details in a viewer-style modal. Results survive refreshes and folder
+  navigation in the same tab. Upload progress and cancellation remain available.
+  Completion and error messages do not open blocking alerts; delete/discard
+  confirmations still appear before those actions.
 - Cross-folder clipboard with individual success, failure, and skipped results.
   Failed or skipped clipboard items remain available to retry after a refresh.
 - Drag-and-drop or multi-file uploads with progress and cancellation. Existing
@@ -83,4 +88,5 @@ python3 -B -m unittest discover -s tests -v
 Tests use the standard library, in-memory HTTP connections, and disposable files.
 If Node.js is available, the same command also checks generated JavaScript syntax
 and exercises editor modes and line numbers, swipe/pinch handling, fullscreen,
-directory sizes, uploads, and clipboard behavior in a mock DOM. Node.js is optional and is not a server dependency.
+directory sizes, uploads, clipboard behavior, and operation status/details in a
+mock DOM. Node.js is optional and is not a server dependency.

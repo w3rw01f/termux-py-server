@@ -1098,6 +1098,40 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     padding: 0 4px;
   }}
   .stats-bar {{ margin-bottom: 8px; }}
+  .operation-status {{ margin-left: auto; max-width: 100%; min-width: 0; }}
+  .status-message {{
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+  }}
+  .operation-status .status-message {{
+    max-width: 40ch;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .status-message[data-level="success"] {{ color: var(--accent); }}
+  .status-message[data-level="warning"] {{ color: var(--warn); }}
+  .status-message[data-level="error"] {{ color: var(--danger); }}
+  #operationBackdrop {{ z-index: 120; }}
+  .editor-modal.operation-modal {{ height: auto; max-height: 80vh; max-width: 760px; }}
+  #operationBackdrop .editor-header {{ flex-shrink: 0; }}
+  .operation-details {{
+    margin: 0;
+    padding: 16px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: inherit;
+    font-size: 13px;
+    min-height: 80px;
+  }}
   /* Storage Footer Bar below File List */
   .footer-bar {{ margin-top: 10px; }}
   .storage-info {{
@@ -1566,12 +1600,12 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 <main>
   <div class="stats-bar">
     <span>{dir_count} folders, {file_count} files</span>
-    <div id="uploadBar" class="storage-info" style="display:none">
-      <div class="storage-meter">
+    <div id="uploadBar" class="storage-info operation-status" role="status" aria-live="polite" style="display:none">
+      <div id="uploadMeter" class="storage-meter" style="display:none">
         <div id="uploadFill" class="storage-fill fill-neutral" style="width: 0%"></div>
       </div>
-      <span id="uploadText" role="status" aria-live="polite">0 B / 0 B (0%)</span>
-      <button type="button" id="cancelUploadBtn" class="btn btn-danger">Cancel upload</button>
+      <button type="button" id="uploadText" class="status-message" aria-haspopup="dialog" aria-controls="operationBackdrop" title="View operation details"></button>
+      <button type="button" id="cancelUploadBtn" class="btn btn-danger" style="display:none">Cancel upload</button>
     </div>
   </div>
   <div class="table-wrap">
@@ -1599,6 +1633,17 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   </div>
 </main>
 
+<!-- Details are opened on demand; operation results never block the next action. -->
+<div id="operationBackdrop" class="modal-backdrop">
+  <section class="editor-modal operation-modal" role="dialog" aria-modal="true" aria-labelledby="operationTitle">
+    <div class="editor-header">
+      <span id="operationTitle" class="editor-title">Operation details</span>
+      <button type="button" id="operationCloseBtn" class="btn">Close</button>
+    </div>
+    <pre id="operationDetails" class="operation-details" tabindex="0"></pre>
+  </section>
+</div>
+
 <!-- Modal for Rename / New Folder / New Text File / Delete Confirm -->
 <div id="modalBackdrop" class="modal-backdrop">
   <div class="modal">
@@ -1617,6 +1662,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         <option value="replace">Replace existing files</option>
       </select>
     </label>
+    <button type="button" id="modalStatus" class="status-message" aria-haspopup="dialog" aria-controls="operationBackdrop" style="display:none"></button>
     <div class="modal-actions">
       <button type="button" class="btn" id="modalCancelBtn">Cancel</button>
       <button type="button" class="btn btn-primary" id="modalConfirmBtn">Confirm</button>
@@ -1648,7 +1694,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         <span id="editorCursorPos" class="cursor-pos">Ln 1, Col 1</span>
         <span id="editorStats">0 lines, 0 chars</span>
       </div>
-      <span id="editorStatus">Read-only mode</span>
+      <button type="button" id="editorStatus" class="status-message" aria-haspopup="dialog" aria-controls="operationBackdrop" title="View latest operation details">Read-only mode</button>
     </div>
   </div>
 </div>
@@ -1705,9 +1751,20 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
   const uploadBar = byId('uploadBar');
   const uploadFill = byId('uploadFill');
+  const uploadMeter = byId('uploadMeter');
   const uploadText = byId('uploadText');
   const cancelUploadBtn = byId('cancelUploadBtn');
   let activeUpload = null;
+  let uploadProgressText = '';
+  let uploadFileDetails = '';
+  let lastOperation = null;
+  let statusPersisted = false;
+  let statusReturnFocus = null;
+  const OPERATION_STATUS_KEY = 'termux_http_operation_v1';
+  const operationBackdrop = byId('operationBackdrop');
+  const operationDetails = byId('operationDetails');
+  const operationCloseBtn = byId('operationCloseBtn');
+  const modalStatus = byId('modalStatus');
 
   const tbody = byId('fileBody');
   const rows = Array.from(tbody.querySelectorAll('.item-row'));
@@ -1832,7 +1889,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   // Upload files with top progress bar (via button or drag & drop)
   async function uploadFileList(files) {{
     if (!files || !files.length) return;
-    if (activeUpload) {{ alert('An upload is already in progress'); return; }}
+    if (activeUpload) {{ showStatus('Upload in progress', 'An upload is already in progress. Wait for it to finish or cancel it.'); return; }}
     files = Array.from(files);
     try {{
       const data = await apiCall({{ action: 'upload_conflicts', dir: CURRENT_DIR, names: files.map(f => f.name) }});
@@ -1848,7 +1905,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       }} else {{
         startUpload(files, 'keep');
       }}
-    }} catch (err) {{ alert(err.message); }}
+    }} catch (err) {{ showStatus('Upload failed', err.message, 'error'); }}
   }}
 
   function startUpload(files, policy) {{
@@ -1856,15 +1913,17 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     const formData = new FormData();
     files.forEach(f => formData.append('file', f));
     const xhr = activeUpload = new XMLHttpRequest();
-    uploadBar.style.display = 'inline-flex';
     uploadFill.style.width = '0%';
-    uploadText.textContent = 'Uploading...';
+    uploadProgressText = 'Uploading...';
+    uploadFileDetails = files.map(f => f.name).join('\\n');
+    renderOperationStatus();
     cancelUploadBtn.disabled = false;
     xhr.upload.addEventListener('progress', (e) => {{
       if (!e.lengthComputable) return;
       const pct = Math.min(100, Math.round((e.loaded / e.total) * 100));
       uploadFill.style.width = `${{pct}}%`;
-      uploadText.textContent = pct === 100 ? 'Finishing upload...' : `${{formatBytes(e.loaded)}} / ${{formatBytes(e.total)}} (${{pct}}%)`;
+      uploadProgressText = pct === 100 ? 'Finishing upload...' : `${{formatBytes(e.loaded)}} / ${{formatBytes(e.total)}} (${{pct}}%)`;
+      renderOperationStatus();
     }});
     xhr.addEventListener('load', () => {{
       activeUpload = null;
@@ -1872,21 +1931,21 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       try {{
         const data = JSON.parse(xhr.responseText);
         if (xhr.status < 200 || xhr.status >= 300 || !data.ok) throw new Error(data.error || 'Upload failed');
-        showResults(data);
-        window.location.reload();
+        showResults(data, 'Upload');
+        reloadAfterOperation();
       }} catch (err) {{
-        uploadText.textContent = err.message;
+        showStatus('Upload failed', err.message, 'error');
       }}
     }});
     xhr.addEventListener('error', () => {{
       activeUpload = null;
       cancelUploadBtn.disabled = true;
-      uploadText.textContent = 'Connection lost. Refresh to check completed files before retrying.';
+      showStatus('Upload connection lost', 'Refresh to check completed files before retrying.\\n' + uploadFileDetails, 'error');
     }});
     xhr.addEventListener('abort', () => {{
       activeUpload = null;
       cancelUploadBtn.disabled = true;
-      uploadText.textContent = 'Upload cancelled. Refresh to check whether it had already completed.';
+      showStatus('Upload cancelled', 'Refresh to check whether the upload had already completed.\\n' + uploadFileDetails, 'warning');
     }});
     xhr.open('POST', window.location.pathname);
     xhr.setRequestHeader('X-Upload-Conflict', policy);
@@ -2003,10 +2062,11 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         sizeButton.title = `${{data.files}} files; ${{data.skipped}} links or unreadable entries skipped. Click to recalculate.`;
         sizeButton.setAttribute('aria-label', `${{r.dataset.rawname}}: ${{sizeButton.textContent}}. Click to recalculate.`);
         r.dataset.size = String(data.bytes);
+        showStatus('Directory size ready', `${{r.dataset.rawname}}: ${{formatBytes(data.bytes)}}\\n${{data.files}} files; ${{data.skipped}} links or unreadable entries skipped.`, data.skipped ? 'warning' : 'success');
       }} catch (err) {{
         sizeButton.textContent = 'Retry';
         sizeButton.title = err.message;
-        alert(err.message);
+        showStatus('Size calculation failed', err.message, 'error');
       }} finally {{ sizeButton.disabled = false; }}
     }});
     link.addEventListener('click', (e) => {{
@@ -2092,13 +2152,80 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     return data;
   }}
 
-  function showResults(data) {{
+  function renderOperationStatus() {{
+    uploadBar.style.display = activeUpload || lastOperation ? 'inline-flex' : 'none';
+    uploadMeter.style.display = activeUpload ? '' : 'none';
+    cancelUploadBtn.style.display = activeUpload ? '' : 'none';
+    uploadText.textContent = activeUpload ? uploadProgressText : lastOperation ? lastOperation.summary : '';
+    uploadText.dataset.level = activeUpload ? 'info' : lastOperation ? lastOperation.level : 'info';
+    uploadText.title = `${{uploadText.textContent}} — click for details`;
+    if (operationBackdrop.classList.contains('open')) renderOperationDetails();
+  }}
+
+  function renderOperationDetails() {{
+    const progress = activeUpload ? `${{uploadProgressText}}\\n${{uploadFileDetails}}\\n\\n` : '';
+    operationDetails.textContent = progress + (lastOperation ? `${{lastOperation.summary}}\\n\\n${{lastOperation.details}}` : '');
+  }}
+
+  function showStatus(summary, details = summary, level = 'info') {{
+    lastOperation = {{ summary, details, level }};
+    statusPersisted = false;
+    try {{
+      sessionStorage.setItem(OPERATION_STATUS_KEY, JSON.stringify(lastOperation));
+      statusPersisted = true;
+    }} catch {{ /* Keep full details in memory if browser storage is unavailable. */ }}
+    renderOperationStatus();
+  }}
+
+  function restoreOperationStatus() {{
+    try {{
+      const value = JSON.parse(sessionStorage.getItem(OPERATION_STATUS_KEY) || 'null');
+      if (value && typeof value.summary === 'string' && typeof value.details === 'string' &&
+          ['info', 'success', 'warning', 'error'].includes(value.level)) {{
+        lastOperation = value;
+        statusPersisted = true;
+      }}
+    }} catch {{ /* A missing or malformed saved message does not block the file list. */ }}
+    renderOperationStatus();
+  }}
+
+  function reloadAfterOperation() {{
+    if (statusPersisted) {{ window.location.reload(); return; }}
+    if (lastOperation) {{
+      lastOperation.details += '\\n\\nRefresh the page to update the file list after reviewing these details.';
+      renderOperationStatus();
+    }}
+  }}
+
+  function openOperationDetails() {{
+    if (!lastOperation && !activeUpload) return;
+    statusReturnFocus = document.activeElement;
+    renderOperationDetails();
+    operationBackdrop.classList.add('open');
+    operationCloseBtn.focus();
+  }}
+
+  function closeOperationDetails() {{
+    operationBackdrop.classList.remove('open');
+    if (statusReturnFocus && statusReturnFocus.isConnected !== false) statusReturnFocus.focus();
+  }}
+
+  uploadText.addEventListener('click', openOperationDetails);
+  editorStatus.addEventListener('click', openOperationDetails);
+  modalStatus.addEventListener('click', openOperationDetails);
+  operationCloseBtn.addEventListener('click', closeOperationDetails);
+  operationBackdrop.addEventListener('click', e => {{
+    if (e.target === operationBackdrop) closeOperationDetails();
+  }});
+
+  function showResults(data, label) {{
     const results = data.results || [];
     const count = status => results.filter(r => r.status === status).length;
-    const summary = `${{count('success')}} succeeded, ${{count('failed')}} failed, ${{count('skipped')}} skipped`;
-    const details = results.slice(0, 50).map(r => `${{r.path}}: ${{r.status}}${{r.error ? ' — ' + r.error : r.name ? ' → ' + r.name : ''}}`);
-    if (results.length > 50) details.push(`...and ${{results.length - 50}} more items`);
-    alert([summary, ...details].join('\\n'));
+    const succeeded = count('success'), failed = count('failed'), skipped = count('skipped');
+    const summary = `${{label}}: ${{succeeded}} done${{failed ? `, ${{failed}} failed` : ''}}${{skipped ? `, ${{skipped}} skipped` : ''}}`;
+    const details = results.map(r => `${{r.path}}: ${{r.status}}${{r.error ? ' — ' + r.error : r.name ? ' → ' + r.name : ''}}`);
+    showStatus(summary, [`${{succeeded}} succeeded, ${{failed}} failed, ${{skipped}} skipped`, ...details].join('\\n'),
+      failed ? 'error' : skipped ? 'warning' : 'success');
   }}
 
   pasteHereBtn.addEventListener('click', async () => {{
@@ -2111,13 +2238,13 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         items: clip.items,
         dest_dir: CURRENT_DIR,
       }});
-      showResults(result);
+      showResults(result, clip.mode === 'move' ? 'Move' : 'Copy');
       const pending = result.results.filter(r => r.status !== 'success').map(r => r.path);
       if (pending.length) setClipboard(clip.mode, pending);
       else clearClipboard();
-      window.location.reload();
+      reloadAfterOperation();
     }} catch (err) {{
-      alert(err.message);
+      showStatus('Transfer failed', err.message, 'error');
       pasteHereBtn.disabled = false;
     }}
   }});
@@ -2223,7 +2350,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         updateEditorCursorPos();
       }}, 20);
     }} catch (err) {{
-      alert(err.message);
+      showStatus('Could not open file', err.message, 'error');
     }}
   }}
 
@@ -2244,8 +2371,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       editorReloadOnClose = true;
       editorTitle.textContent = editorTitle.textContent.replace(/\\*$/, '') + (editorDirty ? '*' : '');
       editorStatus.textContent = editorDirty ? 'Earlier changes saved; newer edits are unsaved' : 'Saved ✓';
+      showStatus(editorDirty ? 'Saved; newer edits pending' : 'File saved', `${{currentEditorPath}}\\n${{editorStatus.textContent}}`, 'success');
     }} catch (err) {{
-      alert(err.message);
+      showStatus('Save failed', `${{currentEditorPath}}\\n${{err.message}}`, 'error');
       editorStatus.textContent = 'Save failed';
     }} finally {{
       editorSaveBtn.disabled = false;
@@ -2253,12 +2381,12 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }}
 
   function closeEditor() {{
-    if (editorSaveBtn.disabled) {{ alert('Please wait for the save to finish'); return; }}
+    if (editorSaveBtn.disabled) {{ showStatus('Save in progress', 'Please wait for the save to finish'); return; }}
     if (editorDirty && !confirm('Discard unsaved changes?')) return;
     editorBackdrop.classList.remove('open');
     currentEditorPath = null;
     if (editorReloadOnClose) {{
-      window.location.reload();
+      reloadAfterOperation();
     }}
   }}
 
@@ -2461,6 +2589,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     confirmLabel = 'Confirm',
     onConfirm,
   }}) {{
+    modalStatus.style.display = 'none';
     modalTitle.textContent = title;
     modalDesc.textContent = desc;
     modalInput.style.display = showInput ? 'block' : 'none';
@@ -2503,10 +2632,13 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       const shouldReload = await modalHandler(modalInput.value.trim(), modalExtraCheck.checked);
       closeModal();
       if (shouldReload !== false) {{
-        window.location.reload();
+        reloadAfterOperation();
       }}
     }} catch (err) {{
-      alert(err.message);
+      showStatus(`${{modalTitle.textContent}} failed`, err.message, 'error');
+      modalStatus.textContent = 'Operation failed — view details';
+      modalStatus.dataset.level = 'error';
+      modalStatus.style.display = 'block';
     }} finally {{
       modalConfirmBtn.disabled = false;
     }}
@@ -2535,6 +2667,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       onConfirm: async (newName) => {{
         if (!newName || newName === oldName) return false;
         await apiCall({{ action: 'rename', src: srcPath, new_name: newName }});
+        showStatus('Rename complete', `${{srcPath}} → ${{newName}}`, 'success');
       }},
     }});
   }});
@@ -2552,7 +2685,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       danger: true,
       confirmLabel: 'Delete',
       onConfirm: async () => {{
-        showResults(await apiCall({{ action: 'delete', items: sel.map(r => r.dataset.path) }}));
+        showResults(await apiCall({{ action: 'delete', items: sel.map(r => r.dataset.path) }}), 'Delete');
       }},
     }});
   }});
@@ -2567,6 +2700,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       onConfirm: async (folderName) => {{
         if (!folderName) throw new Error('Folder name is required');
         await apiCall({{ action: 'mkdir', dir: CURRENT_DIR, name: folderName }});
+        showStatus('Folder created', `${{CURRENT_DIR}}${{folderName}}`, 'success');
       }},
     }});
   }});
@@ -2583,6 +2717,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       onConfirm: async (rawName, openAfter) => {{
         if (!rawName) throw new Error('File name is required');
         const res = await apiCall({{ action: 'touch', dir: CURRENT_DIR, name: rawName }});
+        showStatus('File created', res.path, 'success');
         if (openAfter) {{
           await openEditor(res.path, res.name, encodeURIComponent(res.name), true, true);
           return false; // Wait until editor closes to reload list
@@ -2594,6 +2729,14 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
   // Keyboard shortcuts
   window.addEventListener('keydown', (e) => {{
+    if (operationBackdrop.classList.contains('open')) {{
+      if (e.key === 'Escape') {{ e.preventDefault(); closeOperationDetails(); }}
+      else if (e.key === 'Tab') {{
+        e.preventDefault();
+        (document.activeElement === operationCloseBtn ? operationDetails : operationCloseBtn).focus();
+      }}
+      return;
+    }}
     if (editorBackdrop.classList.contains('open')) {{
       if (e.key === 'Escape') closeEditor();
       return;
@@ -2653,6 +2796,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   }});
 
   // Initialize state
+  restoreOperationStatus();
   syncDotfilesUI();
   applyFilter();
   renderClipboardBar();
