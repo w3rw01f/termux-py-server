@@ -22,7 +22,7 @@ and use a trusted network; Basic Authentication does not encrypt HTTP traffic.
 ## Features
 
 - Dark interface with breadcrumbs, filtering, sorting, and optional dotfile display.
-- Select mode with copy, move, rename, edit, ZIP download, extract, and delete.
+- Select mode with copy, move, rename, edit, and delete.
 - Cross-folder clipboard with individual success, failure, and skipped results.
   Failed or skipped clipboard items remain available to retry after a refresh.
 - Drag-and-drop or multi-file uploads with progress and cancellation. Existing
@@ -63,15 +63,12 @@ endings and file permissions are preserved. Atomic replacement changes the file'
 inode; other hard links continue to reference the previous contents.
 
 Symlinks can be listed, renamed, copied as links, moved, or deleted, but cannot be
-opened or traversed. ZIP downloads skip nested symlinks. Filesystem operations
+opened or traversed. Filesystem operations
 assume other local programs are trusted; path checks do not provide isolation
 against a hostile process changing directories concurrently.
 
-ZIP/TAR extraction accepts only regular files and directories, rejects traversal,
-links, and special files, and publishes a completed extraction directory. Limits
-are 10,000 entries and 1 GiB of extracted data per archive. TAR executable bits
-and timestamps are retained without ownership or special permission bits. JSON
-requests are limited to 16 MiB. Limits are constants near the top of `server.py`.
+JSON requests are limited to 16 MiB; uploads accept up to 10,000 files per request.
+Limits are constants near the top of `server.py`.
 
 Single byte ranges, including suffix ranges, are supported. Multiple ranges and
 unknown range units receive the full file. Batch operations continue after item

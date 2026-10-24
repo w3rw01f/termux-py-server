@@ -5,7 +5,7 @@ Features:
   - Termux-inspired dark minimalist UI with monospace typography
   - Sticky breadcrumb navigation bar at the top
   - Hamburger menu: Select mode, + Upload Files, + New Folder, + New Text File, Show .dotfiles (OFF by default)
-  - Hidden-by-default checkboxes; Select mode reveals checkboxes & action bar (Copy, Move, Rename, Edit, Zip, Extract, Delete)
+  - Hidden-by-default checkboxes; Select mode reveals checkboxes & action bar (Copy, Move, Rename, Edit, Delete)
   - Persistent cross-folder clipboard bar (Copy/Cut items, navigate via breadcrumbs, Paste Here)
   - Top monochrome upload progress bar + drag-and-drop uploads + streamed multipart disk writes
   - Bottom storage usage bar showing free space / total space and color-coded fill meter
@@ -34,10 +34,8 @@ import socket
 import sys
 import stat
 import threading
-import tarfile
 import tempfile
 import urllib.parse
-import zipfile
 from email.parser import BytesHeaderParser, HeaderParser
 from contextlib import nullcontext
 from http import HTTPStatus
@@ -51,8 +49,7 @@ FILE_LOCK = threading.RLock()
 TEMP_PREFIX = ".termux-tmp-"
 MAX_TEXT_BYTES = 2 * 1024 * 1024
 MAX_JSON_BYTES = 16 * 1024 * 1024
-MAX_EXTRACT_BYTES = 1024 * 1024 * 1024
-MAX_EXTRACT_FILES = 10000
+MAX_UPLOAD_FILES = 10000
 
 
 class RequestError(ValueError):
@@ -68,10 +65,6 @@ TEXT_EXTENSIONS = {
     ".yaml", ".yml", ".toml", ".ini", ".conf", ".cfg", ".sql", ".lua", ".rb",
     ".php", ".vim", ".env", ".gitignore", ".bashrc", ".zshrc", ".properties",
 }
-
-EXTRACTABLE_SUFFIXES = (
-    ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
-)
 
 FILE_CATEGORIES = {
     "code": {
@@ -98,14 +91,6 @@ FILE_CATEGORIES = {
         },
         "badge": "IMG",
         "class": "ft-img",
-    },
-    "archive": {
-        "exts": {
-            ".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz", ".zst",
-            ".7z", ".rar", ".apk", ".deb", ".iso", ".img",
-        },
-        "badge": "PKG",
-        "class": "ft-pkg",
     },
     "doc": {
         "exts": {
@@ -138,21 +123,6 @@ def is_text_editable(name: str, is_dir: bool) -> bool:
         return True
     _, ext = os.path.splitext(lower)
     return ext in TEXT_EXTENSIONS
-
-
-def is_extractable_archive(name: str, is_dir: bool) -> bool:
-    if is_dir:
-        return False
-    lower = name.lower()
-    return any(lower.endswith(sfx) for sfx in EXTRACTABLE_SUFFIXES)
-
-
-def strip_archive_suffix(name: str) -> str:
-    lower = name.lower()
-    for sfx in sorted(EXTRACTABLE_SUFFIXES, key=len, reverse=True):
-        if lower.endswith(sfx):
-            return name[: len(name) - len(sfx)] or "extracted"
-    return os.path.splitext(name)[0] or "extracted"
 
 
 def human_size(num_bytes: int) -> str:
@@ -204,79 +174,6 @@ def unique_dest_path(dest_dir: str, basename: str) -> str:
         if not os.path.exists(candidate) and not os.path.islink(candidate):
             return candidate
         counter += 1
-
-
-def copy_limited(source, destination, limit):
-    total = 0
-    while True:
-        chunk = source.read(min(65536, limit - total + 1))
-        if not chunk:
-            return total
-        total += len(chunk)
-        if total > limit:
-            raise ValueError("Extracted data exceeds the size limit")
-        destination.write(chunk)
-
-
-def safe_extract_archive(archive_path: str, extract_dir: str):
-    """Extract regular files/directories only, with path, count and size limits."""
-    total = 0
-    count = 0
-    root = os.path.realpath(extract_dir)
-
-    def destination(name, size):
-        nonlocal count
-        count += 1
-        if count > MAX_EXTRACT_FILES:
-            raise ValueError("Archive has too many entries")
-        normalized = name.replace("\\", "/")
-        if normalized.startswith("/") or ".." in normalized.split("/"):
-            raise ValueError("Unsafe archive path")
-        target = os.path.realpath(os.path.join(root, normalized))
-        if os.path.commonpath([root, target]) != root:
-            raise ValueError("Archive path escapes extraction directory")
-        if any(part.startswith(TEMP_PREFIX) for part in normalized.split("/")):
-            raise ValueError("Reserved archive path")
-        if size < 0 or total + size > MAX_EXTRACT_BYTES:
-            raise ValueError("Archive exceeds extracted size limit")
-        return target
-
-    def extract_file(target, source):
-        nonlocal total
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with source, open(target, "xb") as output:
-            total += copy_limited(source, output, MAX_EXTRACT_BYTES - total)
-
-    if archive_path.lower().endswith(".zip"):
-        with zipfile.ZipFile(archive_path) as archive:
-            for member in archive.infolist():
-                kind = stat.S_IFMT(member.external_attr >> 16)
-                if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
-                    raise ValueError("Archive links and special files are disabled")
-                target = destination(member.filename, member.file_size)
-                if member.is_dir():
-                    os.makedirs(target, exist_ok=True)
-                else:
-                    extract_file(target, archive.open(member))
-    else:
-        directory_metadata = []
-        with tarfile.open(archive_path, "r:*") as archive:
-            for member in archive:
-                if not (member.isfile() or member.isdir()):
-                    raise ValueError("Archive links and special files are disabled")
-                target = destination(member.name, member.size)
-                if hasattr(tarfile, "data_filter"):
-                    member = tarfile.data_filter(member, root)
-                if member.isdir():
-                    os.makedirs(target, exist_ok=True)
-                    directory_metadata.append((target, member))
-                else:
-                    extract_file(target, archive.extractfile(member))
-                    # Preserve executable scripts and timestamps without special bits/ownership.
-                    os.chmod(target, ((member.mode or 0o600) & 0o777) | 0o600)
-                    os.utime(target, (member.mtime, member.mtime))
-        for target, member in reversed(directory_metadata):
-            os.utime(target, (member.mtime, member.mtime))
 
 
 def read_text_version(target):
@@ -445,11 +342,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if not self.check_auth():
             return
-        parsed = urllib.parse.urlsplit(self.path)
-        qs = urllib.parse.parse_qs(parsed.query)
-        if qs.get("action") == ["zip"]:
-            self.handle_zip_download(qs.get("item", []))
-            return
         try:
             path = self.translate_path(self.path)
             range_header = self.headers.get("Range")
@@ -476,64 +368,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
             return
         self.send_error(HTTPStatus.BAD_REQUEST, "Unsupported Content-Type")
 
-    def handle_zip_download(self, items: list):
-        """Package selected files/directories into a streamed temporary .zip archive."""
-        try:
-            if not items:
-                self.send_error(HTTPStatus.BAD_REQUEST, "No items selected for zip")
-                return
-            resolved = []
-            for rel in items:
-                target = resolve_safe_path(rel)
-                if os.path.exists(target):
-                    resolved.append((rel, target))
-            if not resolved:
-                self.send_error(HTTPStatus.NOT_FOUND, "Selected items not found")
-                return
-
-            if len(resolved) == 1:
-                base_label = os.path.basename(resolved[0][1].rstrip("/\\")) or "archive"
-                zip_name = f"{base_label}.zip"
-            else:
-                zip_name = "selected_files.zip"
-
-            with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024) as tmp_zip:
-                with zipfile.ZipFile(tmp_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    for _, full_path in resolved:
-                        base_name = os.path.basename(full_path.rstrip("/\\"))
-                        if os.path.isdir(full_path) and not os.path.islink(full_path):
-                            parent_dir = os.path.dirname(full_path.rstrip("/\\"))
-                            for root, dirs, files in os.walk(full_path):
-                                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d)) and not d.startswith(TEMP_PREFIX)]
-                                rel_root = os.path.relpath(root, parent_dir)
-                                if not files and not dirs:
-                                    zf.writestr(rel_root.rstrip("/") + "/", "")
-                                for fname in files:
-                                    fpath = os.path.join(root, fname)
-                                    if os.path.isfile(fpath) and not os.path.islink(fpath) and not fname.startswith(TEMP_PREFIX):
-                                        resolve_safe_path(os.path.relpath(fpath, SERVER_ROOT))
-                                        arcname = os.path.join(rel_root, fname)
-                                        zf.write(fpath, arcname)
-                        elif os.path.isfile(full_path):
-                            zf.write(full_path, base_name)
-
-                size = tmp_zip.tell()
-                tmp_zip.seek(0)
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "application/zip")
-                safe_zip_name = urllib.parse.quote(zip_name)
-                self.send_header(
-                    "Content-Disposition",
-                    f"attachment; filename=\"download.zip\"; filename*=UTF-8''{safe_zip_name}",
-                )
-                self.send_header("Content-Length", str(size))
-                self.end_headers()
-                shutil.copyfileobj(tmp_zip, self.wfile, length=64 * 1024)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except Exception as exc:
-            self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
-
     def handle_file_upload(self, content_type: str):
         """Stage the entire multipart request before publishing completed files."""
         staged = []
@@ -557,7 +391,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
             if reader.take_until(b"\r\n", 204) != b"--" + boundary.encode("ascii"):
                 raise ValueError("Invalid initial multipart boundary")
             while True:
-                if len(staged) >= MAX_EXTRACT_FILES:
+                if len(staged) >= MAX_UPLOAD_FILES:
                     raise ValueError("Too many uploaded files")
                 headers = HeaderParser().parsestr(reader.take_until(b"\r\n\r\n", 65536).decode("utf-8") + "\r\n\r\n")
                 filename = headers.get_filename()
@@ -661,7 +495,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
         return {"ok": True, "results": results, "deleted" if action == "delete" else "processed": succeeded}
 
     def handle_api_action(self):
-        """Handle JSON file operations: delete, rename, copy, move, mkdir, touch, read_text, write_text, extract."""
+        """Handle JSON file operations: delete, rename, copy, move, mkdir, touch, read_text, write_text, upload_conflicts, directory_size."""
         try:
             content_length = int(self.headers.get("Content-Length", 0))
             if not 0 < content_length <= MAX_JSON_BYTES:
@@ -679,7 +513,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
         action = data.get("action")
         try:
-            with FILE_LOCK if action in ("delete", "copy", "move", "rename", "mkdir", "touch", "write_text", "extract") else nullcontext():
+            with FILE_LOCK if action in ("delete", "copy", "move", "rename", "mkdir", "touch", "write_text") else nullcontext():
                 if action in ("delete", "copy", "move"):
                     self.send_json(HTTPStatus.OK, self.handle_batch(data))
 
@@ -773,26 +607,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                         except (OSError, ValueError):
                             skipped += 1
                     self.send_json(HTTPStatus.OK, {"ok": True, "bytes": size, "files": files, "skipped": skipped})
-
-                elif action == "extract":
-                    src_rel = data.get("src", "")
-                    src_path = resolve_safe_path(src_rel)
-                    if not os.path.isfile(src_path):
-                        raise ValueError("Archive file not found")
-                    parent_dir = os.path.dirname(src_path)
-                    folder_stem = strip_archive_suffix(os.path.basename(src_path))
-                    extract_dir = unique_dest_path(parent_dir, folder_stem)
-                    stage = tempfile.mkdtemp(dir=parent_dir, prefix=TEMP_PREFIX)
-                    try:
-                        safe_extract_archive(src_path, stage)
-                        os.rename(stage, extract_dir)
-                    finally:
-                        if os.path.exists(stage):
-                            shutil.rmtree(stage, ignore_errors=True)
-                    self.send_json(
-                        HTTPStatus.OK,
-                        {"ok": True, "extracted_to": os.path.basename(extract_dir)},
-                    )
 
                 else:
                     self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"Unknown action: {action}"})
@@ -891,7 +705,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
             badge, css_class = classify_file(name, is_dir, is_link)
             editable = int(not is_link and is_text_editable(name, is_dir))
-            extractable = int(not is_link and is_extractable_archive(name, is_dir))
             preview_kind = ""
             if css_class == "ft-img":
                 preview_kind = "image"
@@ -916,7 +729,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 "is_dir": 1 if is_dir else 0,
                 "is_link": int(is_link),
                 "editable": editable,
-                "extractable": extractable,
                 "preview": preview_kind,
                 "size": size,
                 "size_str": size_str,
@@ -958,7 +770,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
                 f'data-isdir="{it["is_dir"]}" '
                 f'data-islink="{it["is_link"]}" '
                 f'data-editable="{it["editable"]}" '
-                f'data-extractable="{it["extractable"]}" '
                 f'data-preview="{it["preview"]}" '
                 f'data-href="{html.escape(it["href"], quote=True)}" '
                 f'data-name="{html.escape(it["name"].lower(), quote=True)}" '
@@ -1022,7 +833,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     --code: #4ade80;
     --media: #c084fc;
     --img: #f472b6;
-    --pkg: #fb923c;
+    --warn: #fb923c;
     --doc: #facc15;
     --link: #2dd4bf;
     --file: #cbd5e1;
@@ -1309,7 +1120,7 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     transition: width 0.2s ease;
   }}
   .fill-ok {{ background: var(--accent); }}
-  .fill-warn {{ background: var(--pkg); }}
+  .fill-warn {{ background: var(--warn); }}
   .fill-high {{ background: var(--danger); }}
   .fill-neutral {{ background: var(--file); }}
   .table-wrap {{
@@ -1418,9 +1229,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
 
   .ft-img .fname {{ color: var(--img); }}
   .badge-ft-img {{ color: var(--img); background: rgba(244, 114, 182, 0.12); border-color: rgba(244, 114, 182, 0.3); }}
-
-  .ft-pkg .fname {{ color: var(--pkg); }}
-  .badge-ft-pkg {{ color: var(--pkg); background: rgba(251, 146, 60, 0.12); border-color: rgba(251, 146, 60, 0.3); }}
 
   .ft-doc .fname {{ color: var(--doc); }}
   .badge-ft-doc {{ color: var(--doc); background: rgba(250, 204, 21, 0.12); border-color: rgba(250, 204, 21, 0.3); }}
@@ -1738,8 +1546,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
       <button type="button" class="btn" id="actMoveBtn" title="Cut selected to move" disabled>Move</button>
       <button type="button" class="btn" id="actRenameBtn" title="Rename single selected item" disabled>Rename</button>
       <button type="button" class="btn" id="actEditBtn" title="Open selected file in text editor" disabled>Edit</button>
-      <button type="button" class="btn" id="actZipBtn" title="Download selected items as .zip" disabled>Zip</button>
-      <button type="button" class="btn" id="actExtractBtn" title="Extract selected archive" disabled>Extract</button>
       <button type="button" class="btn btn-danger" id="actDeleteBtn" title="Delete selected items" disabled>Delete</button>
       <button type="button" class="btn" id="actExitSelectBtn" title="Exit Select Mode">Done</button>
     </div>
@@ -1914,8 +1720,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
   const actMoveBtn = byId('actMoveBtn');
   const actRenameBtn = byId('actRenameBtn');
   const actEditBtn = byId('actEditBtn');
-  const actZipBtn = byId('actZipBtn');
-  const actExtractBtn = byId('actExtractBtn');
   const actDeleteBtn = byId('actDeleteBtn');
   const actExitSelectBtn = byId('actExitSelectBtn');
 
@@ -2177,11 +1981,9 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     selectedCountText.textContent = `${{count}} item${{count === 1 ? '' : 's'}} selected`;
     actCopyBtn.disabled = count === 0;
     actMoveBtn.disabled = count === 0;
-    actZipBtn.disabled = count === 0;
     actDeleteBtn.disabled = count === 0;
     actRenameBtn.disabled = count !== 1;
     actEditBtn.disabled = !(count === 1 && selected[0].dataset.isdir === '0' && selected[0].dataset.islink !== '1');
-    actExtractBtn.disabled = !(count === 1 && selected[0].dataset.extractable === '1');
     selectAllCheck.checked = visible.length > 0 && visible.every(r => r.querySelector('.row-check').checked);
     selectAllCheck.indeterminate = count > 0 && !selectAllCheck.checked;
   }}
@@ -2317,30 +2119,6 @@ class TermuxHTTPRequestHandler(SimpleHTTPRequestHandler):
     }} catch (err) {{
       alert(err.message);
       pasteHereBtn.disabled = false;
-    }}
-  }});
-
-  // Zip download action
-  actZipBtn.addEventListener('click', () => {{
-    const paths = getSelectedRows().map(r => r.dataset.path);
-    if (!paths.length) return;
-    const params = new URLSearchParams({{ action: 'zip' }});
-    paths.forEach(p => params.append('item', p));
-    window.location.href = `${{window.location.pathname}}?${{params.toString()}}`;
-    setSelectMode(false);
-  }});
-
-  // Archive extract action
-  actExtractBtn.addEventListener('click', async () => {{
-    const sel = getSelectedRows();
-    if (sel.length !== 1) return;
-    actExtractBtn.disabled = true;
-    try {{
-      await apiCall({{ action: 'extract', src: sel[0].dataset.path }});
-      window.location.reload();
-    }} catch (err) {{
-      alert(err.message);
-      actExtractBtn.disabled = false;
     }}
   }});
 
